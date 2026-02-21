@@ -79,11 +79,14 @@ export interface TokenCandidate {
 
 const DEXSCREENER_API = "https://api.dexscreener.com";
 
-// Aggressive filter thresholds
-const MIN_VOLUME_24H = 10_000;    // $10k
-const MIN_LIQUIDITY = 25_000;     // $25k
-const MIN_PAIR_AGE_MS = 60 * 60 * 1000; // 1 hour
-const MIN_BUY_SELL_RATIO = 0.5;   // At least some buy pressure
+// Conservative filter thresholds
+const MIN_VOLUME_24H = 25_000;    // $25k — higher floor to weed out low-activity tokens
+const MIN_LIQUIDITY = 50_000;     // $50k — ensures we can exit positions
+const MIN_PAIR_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — avoid rug-pulls in the first hours
+const MAX_PAIR_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — focus on newly launched tokens
+const MIN_HIKE_FOR_OLD_TOKENS = 20; // % — tokens older than 30 days must show >20% 24h gain
+const MIN_BUY_SELL_RATIO = 0.6;   // Require clear buy pressure
+const MAX_1H_PRICE_CHANGE = 500;  // % — skip vertical pumps likely to dump
 
 // Tokens to always skip (stablecoins, wrapped tokens, etc.)
 const SKIP_TOKENS = new Set([
@@ -201,10 +204,19 @@ export async function scanForCandidates(
     // Liquidity filter
     if ((pair.liquidity?.usd ?? 0) < MIN_LIQUIDITY) continue;
 
-    // Age filter — pair must be at least 1 hour old
+    // Age filter — pair must be at least 6 hours old
     if (pair.pairCreatedAt) {
       const ageMs = now - pair.pairCreatedAt;
       if (ageMs < MIN_PAIR_AGE_MS) continue;
+
+      // Tokens older than 30 days: only buy if 24h price change > 20%
+      if (ageMs > MAX_PAIR_AGE_MS) {
+        const change24h = pair.priceChange?.h24 ?? 0;
+        if (change24h < MIN_HIKE_FOR_OLD_TOKENS) continue;
+      }
+    } else {
+      // No creation date available — skip (can't assess age risk)
+      continue;
     }
 
     // Price must exist
@@ -217,6 +229,10 @@ export async function scanForCandidates(
       const total = h1Txns.buys + h1Txns.sells;
       if (total > 0 && h1Txns.buys / total < MIN_BUY_SELL_RATIO) continue;
     }
+
+    // Skip extreme vertical pumps (likely to crash)
+    const priceChange1h = pair.priceChange?.h1 ?? 0;
+    if (priceChange1h > MAX_1H_PRICE_CHANGE) continue;
 
     // Score the token
     const score = computeScore(pair);
@@ -342,10 +358,12 @@ function computeScore(pair: DexScreenerPair): number {
     score += Math.min(25, Math.log10(liq) * 5);
   }
 
-  // 1h price momentum (0-20 points)
+  // 1h price momentum (0-20 points) — reward moderate momentum, penalise extremes
   const change1h = pair.priceChange?.h1 ?? 0;
-  if (change1h > 0) {
-    score += Math.min(20, change1h * 0.5); // 0.5 points per % gain
+  if (change1h > 0 && change1h <= 200) {
+    score += Math.min(20, change1h * 0.4); // 0.4 points per % gain, capped
+  } else if (change1h > 200) {
+    score -= 10; // Penalise parabolic pumps
   }
 
   // Buy pressure (0-15 points)
@@ -360,10 +378,22 @@ function computeScore(pair: DexScreenerPair): number {
     score += Math.min(5, total * 0.05);
   }
 
-  // Volume/liquidity ratio (0-10 points) — high turnover is good
+  // Volume/liquidity ratio (0-10 points) — moderate turnover is healthy
   if (liq > 0 && vol > 0) {
     const vlRatio = vol / liq;
     score += Math.min(10, vlRatio * 2);
+    // Penalise extremely high turnover (potential wash trading)
+    if (vlRatio > 20) score -= 5;
+  }
+
+  // Pair age bonus: tokens aged 1-7 days get a boost (survived early phase)
+  if (pair.pairCreatedAt) {
+    const ageHours = (Date.now() - pair.pairCreatedAt) / (1000 * 60 * 60);
+    if (ageHours >= 24 && ageHours <= 168) {
+      score += 10; // Sweet-spot age: survived first day, still fresh
+    } else if (ageHours > 168 && ageHours <= 720) {
+      score += 5; // 1-4 weeks old — still viable
+    }
   }
 
   return Math.round(score * 100) / 100;

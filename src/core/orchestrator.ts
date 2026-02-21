@@ -206,9 +206,9 @@ async function tradingCycle(): Promise<void> {
       usdcBalance
     );
 
-    // Filter to only AI-approved buys, sorted by confidence
+    // Filter to only AI-approved buys, sorted by confidence (raised threshold for safety)
     const approvedBuys = aiVerdicts
-      .filter((v) => v.action === "buy" && v.confidence >= 40)
+      .filter((v) => v.action === "buy" && v.confidence >= 55 && v.riskLevel !== "extreme")
       .sort((a, b) => b.confidence - a.confidence);
 
     if (approvedBuys.length === 0) {
