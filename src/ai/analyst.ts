@@ -141,7 +141,7 @@ export async function analyzeTokenCandidates(
     );
 
     const response = await client.messages.create({
-      model: "claude-3-5-haiku-20241022",
+      model: "claude-3-5-haiku-latest",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: userMessage }],
@@ -237,7 +237,7 @@ export async function reviewPortfolio(
     logger.info("Requesting Claude portfolio review");
 
     const response = await client.messages.create({
-      model: "claude-3-5-haiku-20241022",
+      model: "claude-3-5-haiku-latest",
       max_tokens: 768,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: userMessage }],
@@ -281,7 +281,7 @@ export async function explainTrade(
 
   try {
     const response = await client.messages.create({
-      model: "claude-3-5-haiku-20241022",
+      model: "claude-3-5-haiku-latest",
       max_tokens: 128,
       system:
         "You are a concise crypto trading assistant. Explain trades in 1-2 sentences for a Telegram notification. Be direct and factual. No emojis. No markdown.",
