@@ -116,21 +116,23 @@ export async function scanForCandidates(
 ): Promise<TokenCandidate[]> {
   logger.info("Scanning DexScreener for Base chain opportunities...");
 
-  // Fetch multiple queries to cast a wider net
-  const queries = [
-    `${DEXSCREENER_API}/token-profiles/latest/v1`,
-    `${DEXSCREENER_API}/dex/search?q=base`,
-  ];
-
   const allPairs: DexScreenerPair[] = [];
 
   // Also fetch trending / boosted tokens on Base
   try {
-    const trendingRes = await fetchJson<{ pairs?: DexScreenerPair[] }>(
+    const trendingRes = await fetchJson<Array<{ chainId: string; tokenAddress: string }>>(
       `${DEXSCREENER_API}/token-boosts/latest/v1`
     );
-    if (trendingRes.pairs) {
-      allPairs.push(...trendingRes.pairs);
+    // token-boosts returns an array of {chainId, tokenAddress}, we need to fetch full pair data
+    const baseTokens = trendingRes.filter(t => t.chainId === "base").slice(0, 30);
+    if (baseTokens.length > 0) {
+      const addresses = baseTokens.map(t => t.tokenAddress).join(",");
+      const pairsRes = await fetchJson<DexScreenerResponse>(
+        `${DEXSCREENER_API}/tokens/v1/base/${addresses}`
+      );
+      if (pairsRes.pairs) {
+        allPairs.push(...pairsRes.pairs);
+      }
     }
   } catch (err) {
     logger.warn({ err }, "Failed to fetch trending tokens");
@@ -139,7 +141,7 @@ export async function scanForCandidates(
   // Primary: search for Base chain tokens
   try {
     const searchRes = await fetchJson<DexScreenerResponse>(
-      `${DEXSCREENER_API}/dex/search?q=base`
+      `${DEXSCREENER_API}/latest/dex/search?q=base`
     );
     if (searchRes.pairs) {
       allPairs.push(...searchRes.pairs);
@@ -151,7 +153,7 @@ export async function scanForCandidates(
   // Also try searching for trending meme tokens on Base
   try {
     const memeRes = await fetchJson<DexScreenerResponse>(
-      `${DEXSCREENER_API}/dex/search?q=base%20meme`
+      `${DEXSCREENER_API}/latest/dex/search?q=base%20meme`
     );
     if (memeRes.pairs) {
       allPairs.push(...memeRes.pairs);
@@ -253,7 +255,7 @@ export async function scanForCandidates(
 export async function getTokenPrice(tokenAddress: Address): Promise<number | null> {
   try {
     const res = await fetchJson<DexScreenerResponse>(
-      `${DEXSCREENER_API}/dex/tokens/${tokenAddress}`
+      `${DEXSCREENER_API}/tokens/v1/base/${tokenAddress}`
     );
 
     if (!res.pairs || res.pairs.length === 0) return null;
@@ -291,7 +293,7 @@ export async function getTokenPrices(
     try {
       const joined = chunk.join(",");
       const res = await fetchJson<DexScreenerResponse>(
-        `${DEXSCREENER_API}/dex/tokens/${joined}`
+        `${DEXSCREENER_API}/tokens/v1/base/${joined}`
       );
 
       if (!res.pairs) continue;
