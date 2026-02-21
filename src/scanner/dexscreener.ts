@@ -79,14 +79,14 @@ export interface TokenCandidate {
 
 const DEXSCREENER_API = "https://api.dexscreener.com";
 
-// Conservative filter thresholds
-const MIN_VOLUME_24H = 25_000;    // $25k — higher floor to weed out low-activity tokens
-const MIN_LIQUIDITY = 50_000;     // $50k — ensures we can exit positions
-const MIN_PAIR_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — avoid rug-pulls in the first hours
-const MAX_PAIR_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — focus on newly launched tokens
-const MIN_HIKE_FOR_OLD_TOKENS = 20; // % — tokens older than 30 days must show >20% 24h gain
-const MIN_BUY_SELL_RATIO = 0.6;   // Require clear buy pressure
-const MAX_1H_PRICE_CHANGE = 500;  // % — skip vertical pumps likely to dump
+// Lenient filter thresholds — cast a wider net for opportunities
+const MIN_VOLUME_24H = 5_000;     // $5k — lower floor to catch early movers
+const MIN_LIQUIDITY = 10_000;     // $10k — minimum viable liquidity
+const MIN_PAIR_AGE_MS = 1 * 60 * 60 * 1000; // 1 hour — allow newer tokens through
+const MAX_PAIR_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days — broader age window
+const MIN_HIKE_FOR_OLD_TOKENS = 10; // % — tokens older than 90 days must show >10% 24h gain
+const MIN_BUY_SELL_RATIO = 0.4;   // Allow more balanced buy/sell activity
+const MAX_1H_PRICE_CHANGE = 1000; // % — higher ceiling before skipping pumps
 
 // Tokens to always skip (stablecoins, wrapped tokens, etc.)
 const SKIP_TOKENS = new Set([
@@ -128,6 +128,7 @@ export async function scanForCandidates(
     );
     // token-boosts returns an array of {chainId, tokenAddress}, we need to fetch full pair data
     const baseTokens = trendingRes.filter(t => t.chainId === "base").slice(0, 30);
+    console.log({ baseTokens }, "Trending tokens from token-boosts endpoint");
     if (baseTokens.length > 0) {
       const addresses = baseTokens.map(t => t.tokenAddress).join(",");
       // /tokens/v1/ returns a raw array of pairs (not wrapped in { pairs })
