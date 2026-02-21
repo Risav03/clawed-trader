@@ -7,7 +7,7 @@ import {
   getUsdcBalance,
   getUsdcBalanceFormatted,
 } from "../chain/wallet.js";
-import { scanForCandidates, getTokenPrice } from "../scanner/dexscreener.js";
+import { scanForCandidates, getTokenPrice, recordRejections } from "../scanner/dexscreener.js";
 import { buyToken } from "../swap/executor.js";
 import {
   getOpenPositionCount,
@@ -210,6 +210,28 @@ async function tradingCycle(): Promise<void> {
     const approvedBuys = aiVerdicts
       .filter((v) => v.action === "buy" && v.confidence >= 55 && v.riskLevel !== "extreme")
       .sort((a, b) => b.confidence - a.confidence);
+
+    // Record AI rejections so these tokens are skipped in future scans
+    // unless their volume or liquidity changes meaningfully
+    const rejectedTokens = aiVerdicts
+      .filter((v) => v.action === "skip")
+      .map((v) => {
+        const c = candidates.find(
+          (c) => c.address.toLowerCase() === v.address.toLowerCase()
+        );
+        return {
+          address: v.address,
+          volume24h: c?.volume24h ?? 0,
+          liquidity: c?.liquidity ?? 0,
+        };
+      });
+    if (rejectedTokens.length > 0) {
+      recordRejections(rejectedTokens);
+      logger.info(
+        { count: rejectedTokens.length, symbols: rejectedTokens.map((r) => r.address.slice(0, 10)) },
+        "Cached AI rejections (will skip unless metrics change)"
+      );
+    }
 
     if (approvedBuys.length === 0) {
       logger.info("AI rejected all candidates this cycle");

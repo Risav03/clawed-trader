@@ -75,6 +75,75 @@ export interface TokenCandidate {
   dexScreenerUrl: string;
 }
 
+// ── AI Rejection Cache ─────────────────────────────────────────────
+
+interface RejectionSnapshot {
+  volume24h: number;
+  liquidity: number;
+  rejectedAt: number;
+}
+
+// Stores tokens the AI previously rejected, keyed by lowercase address
+const rejectionCache = new Map<string, RejectionSnapshot>();
+
+// If volume or liquidity changed by more than this %, re-evaluate the token
+const REJECTION_CHANGE_THRESHOLD = 0.20; // 20%
+
+// Auto-expire rejections after this duration so tokens get a fresh look
+const REJECTION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+/** Record that the AI rejected a token with the given metrics. */
+export function recordRejection(address: string, volume24h: number, liquidity: number): void {
+  rejectionCache.set(address.toLowerCase(), {
+    volume24h,
+    liquidity,
+    rejectedAt: Date.now(),
+  });
+}
+
+/** Record multiple rejections at once. */
+export function recordRejections(
+  rejections: Array<{ address: string; volume24h: number; liquidity: number }>
+): void {
+  for (const r of rejections) {
+    recordRejection(r.address, r.volume24h, r.liquidity);
+  }
+}
+
+/** Clear the entire rejection cache (useful for manual reset). */
+export function clearRejectionCache(): void {
+  rejectionCache.clear();
+  logger.info("AI rejection cache cleared");
+}
+
+/** Check whether a token should be skipped because the AI already rejected it with similar metrics. */
+function isStillRejected(address: string, currentVolume24h: number, currentLiquidity: number): boolean {
+  const snap = rejectionCache.get(address.toLowerCase());
+  if (!snap) return false;
+
+  // Expired — give it another chance
+  if (Date.now() - snap.rejectedAt > REJECTION_TTL_MS) {
+    rejectionCache.delete(address.toLowerCase());
+    return false;
+  }
+
+  // Check if volume or liquidity changed meaningfully
+  const volChange = snap.volume24h > 0
+    ? Math.abs(currentVolume24h - snap.volume24h) / snap.volume24h
+    : currentVolume24h > 0 ? 1 : 0;
+  const liqChange = snap.liquidity > 0
+    ? Math.abs(currentLiquidity - snap.liquidity) / snap.liquidity
+    : currentLiquidity > 0 ? 1 : 0;
+
+  if (volChange >= REJECTION_CHANGE_THRESHOLD || liqChange >= REJECTION_CHANGE_THRESHOLD) {
+    // Metrics changed enough — remove from cache and re-evaluate
+    rejectionCache.delete(address.toLowerCase());
+    return false;
+  }
+
+  return true; // still rejected, skip it
+}
+
 // ── Constants ──────────────────────────────────────────────────────
 
 const DEXSCREENER_API = "https://api.dexscreener.com";
@@ -198,6 +267,14 @@ export async function scanForCandidates(
 
     // Skip blacklisted tokens
     if (blacklist.has(addr)) continue;
+
+    // Skip tokens previously rejected by AI (unless volume/liquidity changed)
+    const vol24 = pair.volume?.h24 ?? 0;
+    const liq = pair.liquidity?.usd ?? 0;
+    if (isStillRejected(addr, vol24, liq)) {
+      logger.debug({ symbol: pair.baseToken.symbol, addr }, "Skipping AI-rejected token (metrics unchanged)");
+      continue;
+    }
 
     // Volume filter
     if ((pair.volume?.h24 ?? 0) < MIN_VOLUME_24H) continue;
