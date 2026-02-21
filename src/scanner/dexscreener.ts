@@ -127,11 +127,12 @@ export async function scanForCandidates(
     const baseTokens = trendingRes.filter(t => t.chainId === "base").slice(0, 30);
     if (baseTokens.length > 0) {
       const addresses = baseTokens.map(t => t.tokenAddress).join(",");
-      const pairsRes = await fetchJson<DexScreenerResponse>(
+      // /tokens/v1/ returns a raw array of pairs (not wrapped in { pairs })
+      const pairs = await fetchJson<DexScreenerPair[]>(
         `${DEXSCREENER_API}/tokens/v1/base/${addresses}`
       );
-      if (pairsRes.pairs) {
-        allPairs.push(...pairsRes.pairs);
+      if (pairs && pairs.length > 0) {
+        allPairs.push(...pairs);
       }
     }
   } catch (err) {
@@ -254,14 +255,15 @@ export async function scanForCandidates(
  */
 export async function getTokenPrice(tokenAddress: Address): Promise<number | null> {
   try {
-    const res = await fetchJson<DexScreenerResponse>(
+    // /tokens/v1/ returns a raw array of pairs (not wrapped in { pairs })
+    const pairs = await fetchJson<DexScreenerPair[]>(
       `${DEXSCREENER_API}/tokens/v1/base/${tokenAddress}`
     );
 
-    if (!res.pairs || res.pairs.length === 0) return null;
+    if (!pairs || pairs.length === 0) return null;
 
     // Find the Base chain pair with highest liquidity
-    const basePairs = res.pairs.filter((p) => p.chainId === "base");
+    const basePairs = pairs.filter((p) => p.chainId === "base");
     if (basePairs.length === 0) return null;
 
     basePairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
@@ -292,15 +294,16 @@ export async function getTokenPrices(
   for (const chunk of chunks) {
     try {
       const joined = chunk.join(",");
-      const res = await fetchJson<DexScreenerResponse>(
+      // /tokens/v1/ returns a raw array of pairs (not wrapped in { pairs })
+      const pairs = await fetchJson<DexScreenerPair[]>(
         `${DEXSCREENER_API}/tokens/v1/base/${joined}`
       );
 
-      if (!res.pairs) continue;
+      if (!pairs || pairs.length === 0) continue;
 
       // Group by base token, pick highest-liquidity Base chain pair
       const byToken = new Map<string, DexScreenerPair[]>();
-      for (const pair of res.pairs) {
+      for (const pair of pairs) {
         if (pair.chainId !== "base") continue;
         const addr = pair.baseToken.address.toLowerCase();
         if (!byToken.has(addr)) byToken.set(addr, []);
