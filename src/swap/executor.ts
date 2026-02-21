@@ -1,47 +1,65 @@
-import { type Address, parseUnits, formatUnits, type Hex } from "viem";
+import { type Address, parseUnits, type Hex } from "viem";
 import {
   config,
   USDC_ADDRESS,
   USDC_DECIMALS,
-  ZEROX_EXCHANGE_PROXY,
 } from "../config/index.js";
 import {
   getWalletClient,
   getPublicClient,
   getWalletAddress,
   ensureAllowance,
-  getTokenDecimals,
 } from "../chain/wallet.js";
 import { logger } from "../utils/logger.js";
 
-// ── Types ──────────────────────────────────────────────────────────
+// ── Types (0x v2 Allowance Holder API) ─────────────────────────────
 
-interface ZeroXQuoteResponse {
-  price: string;
-  guaranteedPrice: string;
+interface ZeroXTransaction {
   to: string;
   data: string;
-  value: string;
-  gas: string;
-  estimatedGas: string;
+  gas: string | null;
   gasPrice: string;
-  protocolFee: string;
-  minimumProtocolFee: string;
-  buyTokenAddress: string;
-  sellTokenAddress: string;
+  value: string;
+}
+
+interface ZeroXIssues {
+  allowance: { actual: string; spender: string } | null;
+  balance: { token: string; actual: string; expected: string } | null;
+  simulationIncomplete: boolean;
+  invalidSourcesPassed: string[];
+}
+
+interface ZeroXQuoteResponse {
+  liquidityAvailable: boolean;
   buyAmount: string;
+  buyToken: string;
   sellAmount: string;
-  estimatedPriceImpact: string;
-  sources: Array<{ name: string; proportion: string }>;
-  allowanceTarget: string;
+  sellToken: string;
+  allowanceTarget: string | null;
+  transaction: ZeroXTransaction;
+  issues: ZeroXIssues;
+  minBuyAmount: string;
+  route: {
+    fills: Array<{ from: string; to: string; source: string; proportionBps: string }>;
+    tokens: Array<{ address: string; symbol: string }>;
+  };
+  zid: string;
 }
 
 interface ZeroXPriceResponse {
-  price: string;
-  estimatedPriceImpact: string;
+  liquidityAvailable: boolean;
   buyAmount: string;
+  buyToken: string;
   sellAmount: string;
-  sources: Array<{ name: string; proportion: string }>;
+  sellToken: string;
+  allowanceTarget: string | null;
+  issues: ZeroXIssues;
+  minBuyAmount: string;
+  route: {
+    fills: Array<{ from: string; to: string; source: string; proportionBps: string }>;
+    tokens: Array<{ address: string; symbol: string }>;
+  };
+  zid: string;
 }
 
 export interface SwapResult {
@@ -50,43 +68,80 @@ export interface SwapResult {
   buyAmount?: string;
   sellAmount?: string;
   error?: string;
-  priceImpact?: string;
 }
 
 // ── Constants ──────────────────────────────────────────────────────
 
-const ZEROX_BASE_URL = "https://base.api.0x.org";
+const ZEROX_BASE_URL = "https://api.0x.org";
+const BASE_CHAIN_ID = "8453";
 
 // ── Helpers ────────────────────────────────────────────────────────
 
 function buildHeaders(): Record<string, string> {
   return {
     "0x-api-key": config.zeroXApiKey,
-    "0x-chain-id": "8453",
+    "0x-version": "v2",
     "Content-Type": "application/json",
   };
 }
 
-async function fetchQuote(params: URLSearchParams): Promise<ZeroXQuoteResponse> {
-  const url = `${ZEROX_BASE_URL}/swap/v1/quote?${params.toString()}`;
+function buildParams(
+  sellToken: string,
+  buyToken: string,
+  sellAmount: string,
+  taker: string
+): URLSearchParams {
+  return new URLSearchParams({
+    chainId: BASE_CHAIN_ID,
+    sellToken,
+    buyToken,
+    sellAmount,
+    taker,
+    slippageBps: config.slippageBps.toString(),
+  });
+}
+
+async function fetchQuote(
+  sellToken: string,
+  buyToken: string,
+  sellAmount: string,
+  taker: string
+): Promise<ZeroXQuoteResponse> {
+  const params = buildParams(sellToken, buyToken, sellAmount, taker);
+  const url = `${ZEROX_BASE_URL}/swap/allowance-holder/quote?${params.toString()}`;
   logger.debug({ url: url.replace(config.zeroXApiKey, "***") }, "Fetching 0x quote");
 
   const res = await fetch(url, { headers: buildHeaders() });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`0x API error ${res.status}: ${body}`);
+    throw new Error(`0x quote API error ${res.status}: ${body}`);
   }
-  return res.json() as Promise<ZeroXQuoteResponse>;
+  const data = (await res.json()) as ZeroXQuoteResponse;
+  if (!data.liquidityAvailable) {
+    throw new Error("No liquidity available for this swap");
+  }
+  return data;
 }
 
-async function fetchPrice(params: URLSearchParams): Promise<ZeroXPriceResponse> {
-  const url = `${ZEROX_BASE_URL}/swap/v1/price?${params.toString()}`;
+async function fetchPrice(
+  sellToken: string,
+  buyToken: string,
+  sellAmount: string,
+  taker: string
+): Promise<ZeroXPriceResponse> {
+  const params = buildParams(sellToken, buyToken, sellAmount, taker);
+  const url = `${ZEROX_BASE_URL}/swap/allowance-holder/price?${params.toString()}`;
+
   const res = await fetch(url, { headers: buildHeaders() });
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`0x price API error ${res.status}: ${body}`);
   }
-  return res.json() as Promise<ZeroXPriceResponse>;
+  const data = (await res.json()) as ZeroXPriceResponse;
+  if (!data.liquidityAvailable) {
+    throw new Error("No liquidity available for this swap");
+  }
+  return data;
 }
 
 // ── Public API ─────────────────────────────────────────────────────
@@ -99,15 +154,7 @@ export async function getSwapPrice(
   buyToken: Address,
   sellAmountRaw: bigint
 ): Promise<ZeroXPriceResponse> {
-  const params = new URLSearchParams({
-    sellToken,
-    buyToken,
-    sellAmount: sellAmountRaw.toString(),
-    takerAddress: getWalletAddress(),
-    slippagePercentage: (config.slippageBps / 10000).toString(),
-  });
-
-  return fetchPrice(params);
+  return fetchPrice(sellToken, buyToken, sellAmountRaw.toString(), getWalletAddress());
 }
 
 /**
@@ -122,6 +169,7 @@ export async function buyToken(
   usdcAmount: string
 ): Promise<SwapResult> {
   const sellAmountRaw = parseUnits(usdcAmount, USDC_DECIMALS);
+  const taker = getWalletAddress();
 
   logger.info(
     { token: tokenAddress, usdcAmount, sellAmountRaw: sellAmountRaw.toString() },
@@ -131,12 +179,11 @@ export async function buyToken(
   if (config.dryRun) {
     logger.info("DRY RUN — skipping actual swap execution");
     try {
-      const priceRes = await getSwapPrice(USDC_ADDRESS, tokenAddress, sellAmountRaw);
+      const priceRes = await fetchPrice(USDC_ADDRESS, tokenAddress, sellAmountRaw.toString(), taker);
       return {
         success: true,
         buyAmount: priceRes.buyAmount,
         sellAmount: priceRes.sellAmount,
-        priceImpact: priceRes.estimatedPriceImpact,
       };
     } catch (err) {
       return { success: false, error: String(err) };
@@ -144,30 +191,26 @@ export async function buyToken(
   }
 
   try {
-    // 1. Ensure USDC allowance for 0x
-    const quote = await fetchQuote(
-      new URLSearchParams({
-        sellToken: USDC_ADDRESS,
-        buyToken: tokenAddress,
-        sellAmount: sellAmountRaw.toString(),
-        takerAddress: getWalletAddress(),
-        slippagePercentage: (config.slippageBps / 10000).toString(),
-      })
-    );
+    // 1. Get quote
+    const quote = await fetchQuote(USDC_ADDRESS, tokenAddress, sellAmountRaw.toString(), taker);
 
-    // Use the allowance target from the quote
-    const allowanceTarget = (quote.allowanceTarget || ZEROX_EXCHANGE_PROXY) as Address;
-    await ensureAllowance(USDC_ADDRESS, sellAmountRaw, allowanceTarget);
+    // 2. Ensure USDC allowance — use issues.allowance.spender or allowanceTarget
+    const spender = (quote.issues.allowance?.spender ?? quote.allowanceTarget) as Address | null;
+    if (spender) {
+      await ensureAllowance(USDC_ADDRESS, sellAmountRaw, spender);
+    }
 
-    // 2. Execute the swap
+    // 3. Execute the swap
     const walletClient = getWalletClient();
     const publicClient = getPublicClient();
 
+    const tx = quote.transaction;
     const txHash = await walletClient.sendTransaction({
-      to: quote.to as Address,
-      data: quote.data as Hex,
-      value: BigInt(quote.value || "0"),
-      gas: BigInt(Math.ceil(Number(quote.estimatedGas) * 1.3)), // 30% gas buffer
+      to: tx.to as Address,
+      data: tx.data as Hex,
+      value: BigInt(tx.value || "0"),
+      ...(tx.gas ? { gas: BigInt(Math.ceil(Number(tx.gas) * 1.3)) } : {}),
+      gasPrice: BigInt(tx.gasPrice),
     });
 
     logger.info({ txHash }, "Swap transaction sent, waiting for confirmation...");
@@ -179,12 +222,7 @@ export async function buyToken(
 
     if (receipt.status === "success") {
       logger.info(
-        {
-          txHash,
-          buyAmount: quote.buyAmount,
-          sellAmount: quote.sellAmount,
-          priceImpact: quote.estimatedPriceImpact,
-        },
+        { txHash, buyAmount: quote.buyAmount, sellAmount: quote.sellAmount },
         "BUY swap successful"
       );
       return {
@@ -192,7 +230,6 @@ export async function buyToken(
         txHash,
         buyAmount: quote.buyAmount,
         sellAmount: quote.sellAmount,
-        priceImpact: quote.estimatedPriceImpact,
       };
     } else {
       logger.error({ txHash, receipt }, "BUY swap transaction reverted");
@@ -215,6 +252,8 @@ export async function sellToken(
   tokenAddress: Address,
   amount: bigint
 ): Promise<SwapResult> {
+  const taker = getWalletAddress();
+
   logger.info(
     { token: tokenAddress, amount: amount.toString() },
     "Executing SELL swap"
@@ -223,12 +262,11 @@ export async function sellToken(
   if (config.dryRun) {
     logger.info("DRY RUN — skipping actual sell execution");
     try {
-      const priceRes = await getSwapPrice(tokenAddress, USDC_ADDRESS, amount);
+      const priceRes = await fetchPrice(tokenAddress, USDC_ADDRESS, amount.toString(), taker);
       return {
         success: true,
         buyAmount: priceRes.buyAmount,
         sellAmount: priceRes.sellAmount,
-        priceImpact: priceRes.estimatedPriceImpact,
       };
     } catch (err) {
       return { success: false, error: String(err) };
@@ -237,29 +275,25 @@ export async function sellToken(
 
   try {
     // 1. Get quote
-    const quote = await fetchQuote(
-      new URLSearchParams({
-        sellToken: tokenAddress,
-        buyToken: USDC_ADDRESS,
-        sellAmount: amount.toString(),
-        takerAddress: getWalletAddress(),
-        slippagePercentage: (config.slippageBps / 10000).toString(),
-      })
-    );
+    const quote = await fetchQuote(tokenAddress, USDC_ADDRESS, amount.toString(), taker);
 
-    // 2. Ensure allowance
-    const allowanceTarget = (quote.allowanceTarget || ZEROX_EXCHANGE_PROXY) as Address;
-    await ensureAllowance(tokenAddress, amount, allowanceTarget);
+    // 2. Ensure token allowance
+    const spender = (quote.issues.allowance?.spender ?? quote.allowanceTarget) as Address | null;
+    if (spender) {
+      await ensureAllowance(tokenAddress, amount, spender);
+    }
 
     // 3. Execute the swap
     const walletClient = getWalletClient();
     const publicClient = getPublicClient();
 
+    const tx = quote.transaction;
     const txHash = await walletClient.sendTransaction({
-      to: quote.to as Address,
-      data: quote.data as Hex,
-      value: BigInt(quote.value || "0"),
-      gas: BigInt(Math.ceil(Number(quote.estimatedGas) * 1.3)),
+      to: tx.to as Address,
+      data: tx.data as Hex,
+      value: BigInt(tx.value || "0"),
+      ...(tx.gas ? { gas: BigInt(Math.ceil(Number(tx.gas) * 1.3)) } : {}),
+      gasPrice: BigInt(tx.gasPrice),
     });
 
     logger.info({ txHash }, "Sell transaction sent, waiting for confirmation...");
@@ -271,12 +305,7 @@ export async function sellToken(
 
     if (receipt.status === "success") {
       logger.info(
-        {
-          txHash,
-          buyAmount: quote.buyAmount,
-          sellAmount: quote.sellAmount,
-          priceImpact: quote.estimatedPriceImpact,
-        },
+        { txHash, buyAmount: quote.buyAmount, sellAmount: quote.sellAmount },
         "SELL swap successful"
       );
       return {
@@ -284,7 +313,6 @@ export async function sellToken(
         txHash,
         buyAmount: quote.buyAmount,
         sellAmount: quote.sellAmount,
-        priceImpact: quote.estimatedPriceImpact,
       };
     } else {
       logger.error({ txHash, receipt }, "SELL swap transaction reverted");

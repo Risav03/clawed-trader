@@ -119,7 +119,12 @@ function shutdown(signal: string): void {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-process.on("uncaughtException", (err) => {
+process.on("uncaughtException", (err: NodeJS.ErrnoException) => {
+  // Don't crash the whole bot for recoverable errors like EADDRINUSE
+  if (err.code === "EADDRINUSE" || err.code === "ECONNRESET") {
+    logger.warn({ err }, "Non-fatal uncaught exception (continuing)");
+    return;
+  }
   logger.fatal({ err }, "Uncaught exception");
   shutdown("uncaughtException");
 });

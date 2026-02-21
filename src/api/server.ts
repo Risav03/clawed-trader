@@ -356,6 +356,14 @@ export function startApiServer(port: number): void {
     });
   });
 
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      logger.warn({ port }, "Port in use — API server disabled (bot continues running)");
+    } else {
+      logger.error({ err }, "API server error");
+    }
+  });
+
   server.listen(port, "0.0.0.0", () => {
     logger.info({ port }, "API server listening");
   });

@@ -150,7 +150,13 @@ export async function analyzeTokenCandidates(
     const text =
       response.content[0].type === "text" ? response.content[0].text : "";
 
-    const parsed = JSON.parse(text) as { verdicts: AITokenVerdict[] };
+    // Strip markdown code fences if Claude wrapped the JSON
+    const cleanText = text
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```\s*$/i, "")
+      .trim();
+
+    const parsed = JSON.parse(cleanText) as { verdicts: AITokenVerdict[] };
 
     logger.info(
       {
@@ -240,7 +246,13 @@ export async function reviewPortfolio(
     const text =
       response.content[0].type === "text" ? response.content[0].text : "";
 
-    const parsed = JSON.parse(text) as AIPortfolioAdvice;
+    // Strip markdown code fences if Claude wrapped the JSON
+    const cleanText = text
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```\s*$/i, "")
+      .trim();
+
+    const parsed = JSON.parse(cleanText) as AIPortfolioAdvice;
 
     logger.info(
       { sentiment: parsed.overallSentiment, advice: parsed.positionAdvice.length },
