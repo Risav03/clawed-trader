@@ -43,6 +43,11 @@ let cronTask: cron.ScheduledTask | null = null;
 let isRunning = false; // Guard against overlapping cycles
 let lastEthWarning = 0; // Debounce ETH warnings (once per hour)
 
+// ── Stop-loss monitor state ────────────────────────────────────────
+const STOP_LOSS_POLL_MS = 10_000; // 10 seconds
+let stopLossInterval: ReturnType<typeof setInterval> | null = null;
+let isEvaluatingStopLoss = false; // Guard against overlapping SL checks
+
 // ── Main trading loop ──────────────────────────────────────────────
 
 /**
@@ -70,7 +75,14 @@ async function tradingCycle(): Promise<void> {
     await checkEthBalance();
 
     // ── Step 2: Evaluate stop-losses ───────────────────────────
-    const stopLossResults = await evaluateStopLosses();
+    // Acquire the SL guard so the background monitor skips this window
+    isEvaluatingStopLoss = true;
+    let stopLossResults: Awaited<ReturnType<typeof evaluateStopLosses>>;
+    try {
+      stopLossResults = await evaluateStopLosses();
+    } finally {
+      isEvaluatingStopLoss = false;
+    }
 
     for (const { position, result, reason } of stopLossResults) {
       const profitPercent =
@@ -351,11 +363,89 @@ async function checkEthBalance(): Promise<void> {
   }
 }
 
+// ── Active stop-loss monitor ────────────────────────────────────────
+
+/**
+ * Lightweight loop that checks stop-losses every 10 s.
+ * Runs independently of the main cron-based trading cycle.
+ */
+async function stopLossMonitorTick(): Promise<void> {
+  // Skip if the main trading cycle is already evaluating stop-losses
+  if (isEvaluatingStopLoss) return;
+
+  // Nothing to monitor when there are no open positions
+  if (getOpenPositionCount() === 0) return;
+
+  isEvaluatingStopLoss = true;
+  try {
+    logger.debug("Stop-loss monitor: checking prices...");
+    const stopLossResults = await evaluateStopLosses();
+
+    for (const { position, result, reason } of stopLossResults) {
+      const profitPercent =
+        ((position.currentPrice - position.entryPrice) / position.entryPrice) * 100;
+      const { trailPercent } = computeStopPrice(position);
+
+      await notifyStopLoss(
+        position.tokenSymbol,
+        trailPercent,
+        profitPercent,
+        result.success
+      );
+
+      if (result.success && result.txHash) {
+        await notifySell(
+          position.tokenSymbol,
+          result.buyAmount ?? "0",
+          position.currentPrice,
+          profitPercent,
+          reason,
+          result.txHash
+        );
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, "Stop-loss monitor tick failed");
+  } finally {
+    isEvaluatingStopLoss = false;
+  }
+}
+
+/**
+ * Start the background stop-loss monitor (10 s interval).
+ */
+export function startStopLossMonitor(): void {
+  if (stopLossInterval) return; // already running
+
+  stopLossInterval = setInterval(() => {
+    stopLossMonitorTick().catch((err) => {
+      logger.error({ err }, "Stop-loss monitor unhandled error");
+    });
+  }, STOP_LOSS_POLL_MS);
+
+  logger.info(
+    { intervalMs: STOP_LOSS_POLL_MS },
+    "Active stop-loss monitor started"
+  );
+}
+
+/**
+ * Stop the background stop-loss monitor.
+ */
+export function stopStopLossMonitor(): void {
+  if (stopLossInterval) {
+    clearInterval(stopLossInterval);
+    stopLossInterval = null;
+    logger.info("Active stop-loss monitor stopped");
+  }
+}
+
 // ── Scheduler ──────────────────────────────────────────────────────
 
 /**
  * Start the trading orchestrator.
  * Runs an immediate cycle, then schedules repeats.
+ * Also starts the active stop-loss monitor (10 s polling).
  */
 export function startOrchestrator(): void {
   const intervalMin = config.scanIntervalMin;
@@ -364,6 +454,9 @@ export function startOrchestrator(): void {
     { intervalMin, maxPositions: config.maxPositions, tradePercent: config.tradePercent },
     "Starting orchestrator"
   );
+
+  // Start active stop-loss monitor
+  startStopLossMonitor();
 
   // Run immediately on startup
   tradingCycle().catch((err) => {
@@ -384,6 +477,8 @@ export function startOrchestrator(): void {
  * Stop the orchestrator gracefully.
  */
 export function stopOrchestrator(): void {
+  stopStopLossMonitor();
+
   if (cronTask) {
     cronTask.stop();
     cronTask = null;
