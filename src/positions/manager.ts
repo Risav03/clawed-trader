@@ -1,8 +1,8 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Address } from "viem";
-import { STOP_LOSS_TIERS, config } from "../config/index.js";
+import { formatUnits, type Address } from "viem";
+import { STOP_LOSS_TIERS, config, USDC_DECIMALS } from "../config/index.js";
 import { getTokenPrices, getTokenPrice } from "../scanner/dexscreener.js";
 import { sellAllToken, type SwapResult } from "../swap/executor.js";
 import { logger } from "../utils/logger.js";
@@ -360,13 +360,18 @@ export async function evaluateStopLosses(): Promise<
         const sellProfitPercent =
           ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
+        // buyAmount from 0x API is raw USDC (6 decimals) — format to human-readable
+        const usdcReceived = result.buyAmount
+          ? formatUnits(BigInt(result.buyAmount), USDC_DECIMALS)
+          : "0";
+
         addHistoryEntry({
           type: "sell",
           tokenAddress: pos.tokenAddress,
           tokenSymbol: pos.tokenSymbol,
           price: currentPrice,
           amount: pos.quantity,
-          usdcAmount: result.buyAmount ?? "0", // USDC received
+          usdcAmount: usdcReceived,
           txHash: result.txHash ?? "",
           timestamp: Date.now(),
           reason: "stop-loss",
@@ -416,13 +421,18 @@ export async function forceSell(
       ? ((price - pos.entryPrice) / pos.entryPrice) * 100
       : 0;
 
+    // buyAmount from 0x API is raw USDC (6 decimals) — format to human-readable
+    const usdcReceived = result.buyAmount
+      ? formatUnits(BigInt(result.buyAmount), USDC_DECIMALS)
+      : "0";
+
     addHistoryEntry({
       type: "sell",
       tokenAddress: pos.tokenAddress,
       tokenSymbol: pos.tokenSymbol,
       price: price ?? 0,
       amount: pos.quantity,
-      usdcAmount: result.buyAmount ?? "0",
+      usdcAmount: usdcReceived,
       txHash: result.txHash ?? "",
       timestamp: Date.now(),
       reason,

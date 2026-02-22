@@ -326,8 +326,12 @@ export async function sellToken(
 
 /**
  * Sell all holdings of a token back to USDC.
+ * Retries up to `maxRetries` times with increasing delays on failure.
  */
-export async function sellAllToken(tokenAddress: Address): Promise<SwapResult> {
+export async function sellAllToken(
+  tokenAddress: Address,
+  maxRetries = 4
+): Promise<SwapResult> {
   const { getTokenBalance } = await import("../chain/wallet.js");
   const balance = await getTokenBalance(tokenAddress);
 
@@ -335,5 +339,27 @@ export async function sellAllToken(tokenAddress: Address): Promise<SwapResult> {
     return { success: false, error: "Zero token balance" };
   }
 
-  return sellToken(tokenAddress, balance);
+  let lastError = "Unknown error";
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (attempt > 1) {
+      const delayMs = attempt * 2_000; // 2 s, 4 s, 6 s …
+      logger.warn(
+        { attempt, maxRetries, tokenAddress, delayMs },
+        "Sell attempt failed — retrying"
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+
+    const result = await sellToken(tokenAddress, balance);
+    if (result.success) return result;
+
+    lastError = result.error ?? "Unknown error";
+    logger.error({ attempt, maxRetries, error: lastError }, "Sell swap attempt failed");
+  }
+
+  return {
+    success: false,
+    error: `Sell failed after ${maxRetries} attempts: ${lastError}`,
+  };
 }

@@ -1,5 +1,5 @@
 import { Bot, type Context } from "grammy";
-import type { Address } from "viem";
+import { formatUnits, type Address } from "viem";
 import { config, USDC_DECIMALS } from "../config/index.js";
 import {
   getEthBalanceFormatted,
@@ -270,9 +270,11 @@ export async function notifySell(
 ): Promise<void> {
   const emoji = profitPercent >= 0 ? "🟢" : "🔴";
   const basescanLink = `https://basescan.org/tx/${txHash}`;
+  // usdcReceived comes from 0x API buyAmount which is in raw units (6 decimals)
+  const usdcFormatted = parseFloat(formatUnits(BigInt(usdcReceived), USDC_DECIMALS)).toFixed(2);
   await notify(
     `${emoji} <b>SELL ${symbol}</b> (${reason})\n` +
-      `💰 Received: $${usdcReceived} USDC\n` +
+      `💰 Received: $${usdcFormatted} USDC\n` +
       `💵 Price: $${price.toPrecision(6)}\n` +
       `📊 P&L: ${profitPercent >= 0 ? "+" : ""}${profitPercent.toFixed(2)}%\n` +
       `🔗 <a href="${basescanLink}">View on BaseScan</a>`,
