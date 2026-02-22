@@ -271,7 +271,7 @@ async function doPortfolioReview(): Promise<void> {
 
     logger.info({ sentiment: advice.overallSentiment, summary: advice.summary }, "AI portfolio review");
 
-    for (const posAdvice of advice.positionAdvice) {
+    for (const posAdvice of (advice.positionAdvice ?? [])) {
       if (posAdvice.action === "sell") {
         logger.info({ symbol: posAdvice.symbol, reason: posAdvice.reasoning }, "AI recommends selling");
         const pos = positions.find((p) => p.tokenSymbol === posAdvice.symbol);

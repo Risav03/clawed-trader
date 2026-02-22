@@ -221,6 +221,7 @@ export async function reviewPortfolio(
       .trim();
 
     const parsed = JSON.parse(cleanText) as AIPortfolioAdvice;
+    parsed.positionAdvice ??= [];
 
     logger.info(
       { sentiment: parsed.overallSentiment, advice: parsed.positionAdvice.length },
