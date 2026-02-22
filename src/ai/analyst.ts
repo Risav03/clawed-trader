@@ -1,20 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "../config/index.js";
-import type { TokenCandidate } from "../scanner/dexscreener.js";
 import type { Position } from "../positions/manager.js";
 import { logger } from "../utils/logger.js";
 
 // ── Types ──────────────────────────────────────────────────────────
-
-export interface AITokenVerdict {
-  symbol: string;
-  address: string;
-  action: "buy" | "skip";
-  confidence: number;       // 0-100
-  reasoning: string;
-  riskLevel: "low" | "medium" | "high" | "extreme";
-  suggestedAllocPercent?: number; // Override default 10% if AI suggests less
-}
 
 export interface AIPortfolioAdvice {
   overallSentiment: "bullish" | "neutral" | "bearish";
@@ -26,6 +15,39 @@ export interface AIPortfolioAdvice {
     suggestedTrailPercent?: number;
   }>;
 }
+
+/** Current bot state passed to the NL handler for context */
+export interface BotState {
+  focusedToken: {
+    address: string;
+    symbol: string;
+    stopLossPercent: number;
+    takeProfitPercent: number;
+    active: boolean;
+  } | null;
+  openPositions: Array<{
+    symbol: string;
+    address: string;
+    entryPrice: number;
+    currentPrice: number;
+    profitPercent: number;
+    holdTimeHours: number;
+  }>;
+  usdcBalance: number;
+  ethBalance: string;
+  paused: boolean;
+}
+
+/** Structured action returned by the NL processor */
+export type NLAction =
+  | { type: "set_token"; address: string; stopLossPercent?: number; takeProfitPercent?: number; reply: string }
+  | { type: "set_sl_tp"; stopLossPercent?: number; takeProfitPercent?: number; reply: string }
+  | { type: "stop_token"; reply: string }
+  | { type: "pause"; reply: string }
+  | { type: "resume"; reply: string }
+  | { type: "force_sell"; reply: string }
+  | { type: "query"; reply: string }
+  | { type: "unknown"; reply: string };
 
 // ── Client ─────────────────────────────────────────────────────────
 
@@ -46,147 +68,84 @@ export function isAIEnabled(): boolean {
 
 // ── System prompt ──────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are an expert crypto trading analyst embedded in an autonomous trading bot operating on the Base chain (Layer 2 on Ethereum). Your role is to analyze token data from DexScreener and provide precise, actionable trading decisions with a CONSERVATIVE risk approach.
+const SYSTEM_PROMPT = `You are the AI trading assistant embedded in OpenClaw Trader, an autonomous Base-chain token trading bot. You help the user manage focused single-token trading through natural language.
 
-CONTEXT:
-- The bot trades on Base chain using USDC as the base currency
-- It uses the 0x aggregator for swaps
-- It applies tiered trailing stop-losses: 20% trail at 0-50% profit, 10% at 50-100%, 5% at >100%
-- Max 5 concurrent positions, investing 10% of USDC balance per trade
-- Conservative filter thresholds: >$25k volume/24h, >$50k liquidity, >6 hours old
-- Tokens must be launched within the last 30 days UNLESS they show a >20% 24h price hike
+The bot continuously monitors one token at a time, automatically buying on entry, and selling when either a stop-loss or take-profit level is hit — then immediately re-entering.
 
-RISK POLICY (IMPORTANT):
-- Default stance is SKIP. Only recommend "buy" when evidence is strong.
-- Prefer tokens aged 1-7 days with organic, growing volume over brand-new tokens.
-- Tokens older than 30 days are only eligible if their 24h price change exceeds +20%, indicating renewed momentum.
-- Suggest lower allocation (5-8%) for anything rated "high" risk. Never recommend buying "extreme" risk.
-- If in doubt, skip. Capital preservation > chasing pumps.
+You understand the following intents (respond only in JSON, no markdown):
 
-YOUR ANALYSIS FRAMEWORK:
-1. **Liquidity Depth**: Is there enough liquidity to enter AND exit? Look for at least 3x your position size in liquidity.
-2. **Volume Authenticity**: Is volume organic or wash-traded? Look for reasonable buy/sell ratios (>60% buys), high unique trader counts, and consistent volume across time windows.
-3. **Price Action**: Moderate, sustained momentum is preferred. Vertical pumps (>200% in 1h) without consolidation are red flags — skip them.
-4. **Token Age**: Tokens <6 hours old are excluded by the bot. Sweet spot is 1-7 days with growing metrics. Tokens >30 days need a clear catalyst (>20% 24h gain).
-5. **Red Flags**: Extremely high price changes (>500% in 1h), low unique traders, concentrated liquidity, volume/liquidity ratio >20, no socials or website.
-6. **Exit Feasibility**: Consider whether the position can be exited without significant slippage.
+- set_token: User wants to start trading a specific contract address. Extract the address (must start with 0x), and optional stopLossPercent / takeProfitPercent.
+- set_sl_tp: User wants to change stop-loss and/or take-profit percentages for the current focused token.
+- stop_token: User wants to stop trading the current token entirely.
+- pause: Pause all trading (stop opening new positions).
+- resume: Resume trading.
+- force_sell: Immediately sell the current open position.
+- query: User is asking a question about their portfolio, P&L, status, or crypto in general. Provide a helpful conversational answer.
+- unknown: Could not determine intent clearly.
 
-RESPONSE FORMAT: Always respond with valid JSON matching the requested schema. No markdown, no explanations outside the JSON.`;
+Always respond with VALID JSON matching this EXACT schema:
+{
+  "type": "set_token" | "set_sl_tp" | "stop_token" | "pause" | "resume" | "force_sell" | "query" | "unknown",
+  "address": "0x...",          // only for set_token
+  "stopLossPercent": number,    // only for set_token, set_sl_tp (omit if not specified)
+  "takeProfitPercent": number,  // only for set_token, set_sl_tp (omit if not specified)
+  "reply": "string"             // confirmation or conversational answer
+}
 
-// ── Token analysis ─────────────────────────────────────────────────
+For address extraction: if the user says "trade 0x1234..." or "buy token 0x1234..." or "focus on 0x1234...", extract the Ethereum address.
+For query/unknown, put your full conversational answer in "reply".
+Be concise and helpful. No emojis unless the user uses them. No markdown in replies.`;
+
+// ── Natural language chatbot interface ────────────────────────────
 
 /**
- * Analyze a batch of token candidates using Claude.
- * Returns AI verdicts with buy/skip recommendations.
+ * Parse a free-text Telegram message into a structured bot action.
+ * Passes the full current bot state as context so Claude can give
+ * relevant portfolio-aware answers.
  */
-export async function analyzeTokenCandidates(
-  candidates: TokenCandidate[],
-  currentPortfolio: Position[],
-  usdcBalance: number
-): Promise<AITokenVerdict[]> {
-  if (!client || candidates.length === 0) {
-    // Fallback: approve all candidates (score-only mode)
-    return candidates.map((c) => ({
-      symbol: c.symbol,
-      address: c.address,
-      action: "buy" as const,
-      confidence: c.score,
-      reasoning: "AI disabled — using DexScreener score only",
-      riskLevel: "medium" as const,
-    }));
+export async function processNaturalLanguage(
+  message: string,
+  state: BotState
+): Promise<NLAction> {
+  if (!client) {
+    return {
+      type: "unknown",
+      reply: "AI is not configured. Please set the ANTHROPIC_API_KEY environment variable.",
+    };
   }
 
-  const portfolioSummary = currentPortfolio.map((p) => ({
-    symbol: p.tokenSymbol,
-    entryPrice: p.entryPrice,
-    currentPrice: p.currentPrice,
-    profitPercent: ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100,
-    holdTimeHours: (Date.now() - p.entryTimestamp) / (1000 * 60 * 60),
-  }));
-
-  const candidateData = candidates.slice(0, 5).map((c) => ({
-    symbol: c.symbol,
-    name: c.name,
-    address: c.address,
-    priceUsd: c.priceUsd,
-    volume24h: c.volume24h,
-    liquidity: c.liquidity,
-    priceChange1h: c.priceChange1h,
-    priceChange24h: c.priceChange24h,
-    buysSells1h: c.buysSells1h,
-    pairAgeHours: c.pairCreatedAt
-      ? (Date.now() - c.pairCreatedAt) / (1000 * 60 * 60)
-      : null,
-    dexScreenerScore: c.score,
-  }));
-
-  const userMessage = JSON.stringify({
-    task: "analyze_candidates",
-    usdcBalance,
-    currentPositionCount: currentPortfolio.length,
-    maxPositions: config.maxPositions,
-    investPercentPerTrade: config.tradePercent,
-    currentPortfolio: portfolioSummary,
-    candidates: candidateData,
-    responseSchema: {
-      verdicts: [
-        {
-          symbol: "string",
-          address: "string",
-          action: "buy | skip",
-          confidence: "number 0-100",
-          reasoning: "string (2-3 sentences max)",
-          riskLevel: "low | medium | high | extreme",
-          suggestedAllocPercent: "number | null",
-        },
-      ],
-    },
+  const stateContext = JSON.stringify({
+    focusedToken: state.focusedToken,
+    openPositions: state.openPositions,
+    usdcBalance: state.usdcBalance,
+    ethBalance: state.ethBalance,
+    paused: state.paused,
+    defaultStopLossPercent: config.stopLossPercent,
+    defaultTakeProfitPercent: config.takeProfitPercent,
   });
 
-  try {
-    logger.info(
-      { candidateCount: candidateData.length },
-      "Sending candidates to Claude for analysis"
-    );
+  const userContent = `Current bot state:\n${stateContext}\n\nUser message: ${message}`;
 
+  try {
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
+      max_tokens: 512,
       system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userMessage }],
+      messages: [{ role: "user", content: userContent }],
     });
 
-    const text =
-      response.content[0].type === "text" ? response.content[0].text : "";
+    const text = response.content[0].type === "text" ? response.content[0].text : "";
+    const clean = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+    const parsed = JSON.parse(clean) as NLAction;
 
-    // Strip markdown code fences if Claude wrapped the JSON
-    const cleanText = text
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```\s*$/i, "")
-      .trim();
-
-    const parsed = JSON.parse(cleanText) as { verdicts: AITokenVerdict[] };
-
-    logger.info(
-      {
-        total: parsed.verdicts.length,
-        buys: parsed.verdicts.filter((v) => v.action === "buy").length,
-        skips: parsed.verdicts.filter((v) => v.action === "skip").length,
-      },
-      "Claude analysis complete"
-    );
-
-    return parsed.verdicts;
+    logger.info({ type: parsed.type }, "NL action parsed");
+    return parsed;
   } catch (err) {
-    logger.error({ err }, "Claude analysis failed — falling back to score-only");
-    return candidates.map((c) => ({
-      symbol: c.symbol,
-      address: c.address,
-      action: "buy" as const,
-      confidence: c.score,
-      reasoning: "AI analysis failed — using DexScreener score fallback",
-      riskLevel: "medium" as const,
-    }));
+    logger.error({ err }, "NL processing failed");
+    return {
+      type: "unknown",
+      reply: "I had trouble understanding that. Please try rephrasing, or use a slash command like /status or /portfolio.",
+    };
   }
 }
 

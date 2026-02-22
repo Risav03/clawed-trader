@@ -27,8 +27,6 @@ interface AppConfig {
   baseRpcUrl: string;
   /** ETH balance below which a warning is sent (in wei) */
   ethWarnThreshold: bigint;
-  /** How often to scan DexScreener (minutes) */
-  scanIntervalMin: number;
   /** Maximum concurrent token positions */
   maxPositions: number;
   /** Percentage of USDC balance to invest per trade */
@@ -43,6 +41,14 @@ interface AppConfig {
   anthropicApiKey: string;
   /** HTTP API port for the public dashboard */
   apiPort: number;
+  /** Flat stop-loss % below entry price (default 5) */
+  stopLossPercent: number;
+  /** Take-profit % above entry price (default 20) */
+  takeProfitPercent: number;
+  /** Seconds to wait before re-entering after SL/TP trigger */
+  reentryCooldownSec: number;
+  /** Pre-seed focused token on startup (optional) */
+  focusedToken: string;
 }
 
 export const config: AppConfig = {
@@ -52,7 +58,6 @@ export const config: AppConfig = {
   zeroXApiKey: "",
   baseRpcUrl: "",
   ethWarnThreshold: 0n,
-  scanIntervalMin: 15,
   maxPositions: 5,
   tradePercent: 10,
   minUsdcBalance: 10,
@@ -60,6 +65,10 @@ export const config: AppConfig = {
   dryRun: false,
   anthropicApiKey: "",
   apiPort: 3000,
+  stopLossPercent: 5,
+  takeProfitPercent: 20,
+  reentryCooldownSec: 30,
+  focusedToken: "",
 };
 
 export function loadConfig(): void {
@@ -72,7 +81,6 @@ export function loadConfig(): void {
 
   config.baseRpcUrl = optionalEnv("BASE_RPC_URL", "https://mainnet.base.org");
   config.ethWarnThreshold = parseEther(optionalEnv("ETH_WARN_THRESHOLD", "0.001"));
-  config.scanIntervalMin = parseInt(optionalEnv("SCAN_INTERVAL_MIN", "15"), 10);
   config.maxPositions = parseInt(optionalEnv("MAX_POSITIONS", "5"), 10);
   config.tradePercent = parseInt(optionalEnv("TRADE_PERCENT", "10"), 10);
   config.minUsdcBalance = parseFloat(optionalEnv("MIN_USDC_BALANCE", "10"));
@@ -80,6 +88,10 @@ export function loadConfig(): void {
   config.dryRun = optionalEnv("DRY_RUN", "false").toLowerCase() === "true";
   config.anthropicApiKey = optionalEnv("ANTHROPIC_API_KEY", "");
   config.apiPort = parseInt(optionalEnv("PORT", "3000"), 10);
+  config.stopLossPercent = parseFloat(optionalEnv("STOP_LOSS_PERCENT", "5"));
+  config.takeProfitPercent = parseFloat(optionalEnv("TAKE_PROFIT_PERCENT", "20"));
+  config.reentryCooldownSec = parseInt(optionalEnv("REENTRY_COOLDOWN_SEC", "30"), 10);
+  config.focusedToken = optionalEnv("FOCUSED_TOKEN", "");
 }
 
 // ── Base chain constants ───────────────────────────────────────────

@@ -1,0 +1,9 @@
+{
+  "address": "0xf4bab6ed80cd552419cbecae8c94bda577a84b07",
+  "symbol": "ClawSouls",
+  "name": "ClawSouls",
+  "stopLossPercent": 5,
+  "takeProfitPercent": 20,
+  "active": true,
+  "dexScreenerUrl": "https://dexscreener.com/base/0x6e3ccf188db12ec73c18827c32b546bff0d77b7d29b433f4a67ef0733fa21c2d"
+}

@@ -23,6 +23,23 @@ export interface Position {
   dexScreenerUrl: string;
 }
 
+export interface FocusedTokenConfig {
+  /** Contract address of the token being actively traded */
+  address: string;
+  /** Token symbol (e.g. "DOGE") */
+  symbol: string;
+  /** Full token name */
+  name: string;
+  /** % below entry price to trigger stop-loss sell */
+  stopLossPercent: number;
+  /** % above entry price to trigger take-profit sell */
+  takeProfitPercent: number;
+  /** Whether this focused-token loop is currently active */
+  active: boolean;
+  /** DexScreener pair URL for notifications */
+  dexScreenerUrl?: string;
+}
+
 export interface TradeHistoryEntry {
   type: "buy" | "sell";
   tokenAddress: string;
@@ -43,6 +60,7 @@ const DATA_DIR = join(__dirname, "..", "data");
 const POSITIONS_FILE = join(DATA_DIR, "positions.json");
 const BLACKLIST_FILE = join(DATA_DIR, "blacklist.json");
 const HISTORY_FILE = join(DATA_DIR, "history.json");
+const FOCUSED_FILE = join(DATA_DIR, "focused.json");
 
 // ── State ──────────────────────────────────────────────────────────
 
@@ -50,6 +68,7 @@ let positions: Position[] = [];
 let blacklist: Set<string> = new Set();
 let history: TradeHistoryEntry[] = [];
 let tradingPaused = false;
+let focusedToken: FocusedTokenConfig | null = null;
 
 // ── Persistence ────────────────────────────────────────────────────
 
@@ -84,9 +103,10 @@ export function initPositionManager(): void {
   const blacklistArr = loadJson<string[]>(BLACKLIST_FILE, []);
   blacklist = new Set(blacklistArr.map((a) => a.toLowerCase()));
   history = loadJson<TradeHistoryEntry[]>(HISTORY_FILE, []);
+  focusedToken = loadJson<FocusedTokenConfig | null>(FOCUSED_FILE, null);
 
   logger.info(
-    { positions: positions.length, blacklist: blacklist.size, history: history.length },
+    { positions: positions.length, blacklist: blacklist.size, history: history.length, focusedToken: focusedToken?.symbol ?? "none" },
     "Position manager initialized"
   );
 }
@@ -124,6 +144,24 @@ export function isTradingPaused(): boolean {
 export function setPaused(paused: boolean): void {
   tradingPaused = paused;
   logger.info({ paused }, "Trading paused state changed");
+}
+
+// ── Focused token management ─────────────────────────────────────────────────
+
+export function getFocusedToken(): FocusedTokenConfig | null {
+  return focusedToken;
+}
+
+export function setFocusedToken(cfg: FocusedTokenConfig): void {
+  focusedToken = cfg;
+  saveJson(FOCUSED_FILE, focusedToken);
+  logger.info({ symbol: cfg.symbol, address: cfg.address, sl: cfg.stopLossPercent, tp: cfg.takeProfitPercent }, "Focused token set");
+}
+
+export function clearFocusedToken(): void {
+  focusedToken = null;
+  saveJson(FOCUSED_FILE, null);
+  logger.info("Focused token cleared");
 }
 
 // ── Position management ────────────────────────────────────────────
@@ -202,7 +240,27 @@ function addHistoryEntry(entry: TradeHistoryEntry): void {
   saveJson(HISTORY_FILE, history);
 }
 
-// ── Stop-loss engine ───────────────────────────────────────────────
+// ── SL/TP engine ──────────────────────────────────────────────────
+
+/**
+ * Check whether the current price has crossed the flat SL or TP threshold.
+ * TP is checked first (profit wins over loss).
+ */
+export function checkTpSl(
+  position: Position,
+  stopLossPercent: number,
+  takeProfitPercent: number,
+  currentPrice: number
+): "hold" | "stop-loss" | "take-profit" {
+  const slPrice = position.entryPrice * (1 - stopLossPercent / 100);
+  const tpPrice = position.entryPrice * (1 + takeProfitPercent / 100);
+
+  if (currentPrice >= tpPrice) return "take-profit";
+  if (currentPrice <= slPrice) return "stop-loss";
+  return "hold";
+}
+
+// ── Stop-loss engine (legacy trailing — used for /portfolio display) ─
 
 /**
  * Compute the trailing stop-loss price for a position.
@@ -334,9 +392,11 @@ export async function evaluateStopLosses(): Promise<
 
 /**
  * Force-sell a specific position.
+ * @param reason - recorded in trade history (default: "manual")
  */
 export async function forceSell(
-  tokenAddress: string
+  tokenAddress: string,
+  reason: string = "manual"
 ): Promise<{ position: Position; result: SwapResult } | null> {
   const pos = getPosition(tokenAddress);
   if (!pos) return null;
@@ -365,7 +425,7 @@ export async function forceSell(
       usdcAmount: result.buyAmount ?? "0",
       txHash: result.txHash ?? "",
       timestamp: Date.now(),
-      reason: "manual",
+      reason,
       profitPercent: sellProfitPercent,
     });
 
@@ -382,5 +442,6 @@ export function saveAllState(): void {
   saveJson(POSITIONS_FILE, positions);
   saveJson(BLACKLIST_FILE, [...blacklist]);
   saveJson(HISTORY_FILE, history);
+  if (focusedToken !== null) saveJson(FOCUSED_FILE, focusedToken);
   logger.info("All state persisted to disk");
 }

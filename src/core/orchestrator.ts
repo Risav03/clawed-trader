@@ -1,4 +1,3 @@
-import cron from "node-cron";
 import { formatUnits, type Address } from "viem";
 import { config, USDC_DECIMALS } from "../config/index.js";
 import {
@@ -7,17 +6,15 @@ import {
   getUsdcBalance,
   getUsdcBalanceFormatted,
 } from "../chain/wallet.js";
-import { scanForCandidates, getTokenPrice, recordRejections } from "../scanner/dexscreener.js";
-import { buyToken } from "../swap/executor.js";
+import { getTokenPrice } from "../scanner/dexscreener.js";
+import { buyToken, type SwapResult } from "../swap/executor.js";
 import {
-  getOpenPositionCount,
-  getHeldTokenAddresses,
-  getBlacklist,
   getPositions,
   isTradingPaused,
-  evaluateStopLosses,
   addPosition,
-  computeStopPrice,
+  checkTpSl,
+  getFocusedToken,
+  getPosition,
   forceSell,
   type Position,
 } from "../positions/manager.js";
@@ -28,9 +25,10 @@ import {
   notifyLowEth,
   notifyError,
   notifyStopLoss,
+  notifyTakeProfit,
+  notifyReentry,
 } from "../telegram/bot.js";
 import {
-  analyzeTokenCandidates,
   reviewPortfolio,
   explainTrade,
   isAIEnabled,
@@ -39,328 +37,202 @@ import { logger } from "../utils/logger.js";
 
 // ── State ──────────────────────────────────────────────────────────
 
-let cronTask: cron.ScheduledTask | null = null;
-let isRunning = false; // Guard against overlapping cycles
-let lastEthWarning = 0; // Debounce ETH warnings (once per hour)
+const TICK_INTERVAL_MS = 10_000;  // 10 seconds
+const ETH_CHECK_TICKS = 6;        // Every 6 ticks = 60 seconds
+const PORTFOLIO_REVIEW_TICKS = 60; // Every 60 ticks = ~10 minutes
 
-// ── Stop-loss monitor state ────────────────────────────────────────
-const STOP_LOSS_POLL_MS = 10_000; // 10 seconds
-let stopLossInterval: ReturnType<typeof setInterval> | null = null;
-let isEvaluatingStopLoss = false; // Guard against overlapping SL checks
+let tickInterval: ReturnType<typeof setInterval> | null = null;
+let tickCount = 0;
+let isTicking = false;            // Guard against overlapping ticks
+let lastEthWarning = 0;           // Debounce: warn at most once per hour
+let reentryCooldownUntil = 0;     // Don't re-buy until this timestamp
 
-// ── Main trading loop ──────────────────────────────────────────────
+// ── Focused token tick ─────────────────────────────────────────────
 
 /**
- * Execute a single trading cycle:
- *  1. Check ETH balance
- *  2. Evaluate stop-losses on existing positions
- *  3. Scan for new opportunities (if under max positions)
- *  4. Execute buys
+ * Core trading tick — runs every 10 seconds.
+ *  1. Periodic ETH balance check
+ *  2. Periodic AI portfolio review
+ *  3. Focused-token buy/SL/TP loop
  */
-async function tradingCycle(): Promise<void> {
-  if (isRunning) {
-    logger.warn("Previous cycle still running, skipping");
-    return;
-  }
-
-  isRunning = true;
-  const cycleStart = Date.now();
+async function tick(): Promise<void> {
+  if (isTicking) return;
+  isTicking = true;
+  tickCount++;
 
   try {
-    logger.info("═══════════════════════════════════════════");
-    logger.info("Starting trading cycle");
-    logger.info("═══════════════════════════════════════════");
-
-    // ── Step 1: Check ETH balance ──────────────────────────────
-    await checkEthBalance();
-
-    // ── Step 2: Evaluate stop-losses ───────────────────────────
-    // Acquire the SL guard so the background monitor skips this window
-    isEvaluatingStopLoss = true;
-    let stopLossResults: Awaited<ReturnType<typeof evaluateStopLosses>>;
-    try {
-      stopLossResults = await evaluateStopLosses();
-    } finally {
-      isEvaluatingStopLoss = false;
+    // Periodic ETH balance check
+    if (tickCount % ETH_CHECK_TICKS === 0) {
+      await checkEthBalance();
     }
 
-    for (const { position, result, reason } of stopLossResults) {
-      const profitPercent =
-        ((position.currentPrice - position.entryPrice) / position.entryPrice) * 100;
-      const { trailPercent } = computeStopPrice(position);
-
-      await notifyStopLoss(
-        position.tokenSymbol,
-        trailPercent,
-        profitPercent,
-        result.success
-      );
-
-      if (result.success && result.txHash) {
-        await notifySell(
-          position.tokenSymbol,
-          result.buyAmount ?? "0",
-          position.currentPrice,
-          profitPercent,
-          reason,
-          result.txHash
-        );
-      }
+    // Periodic AI portfolio review
+    if (tickCount % PORTFOLIO_REVIEW_TICKS === 0 && isAIEnabled()) {
+      await doPortfolioReview();
     }
 
-    // ── Step 3: AI portfolio review ──────────────────────────────
-    if (isAIEnabled()) {
-      const ethBal = await getEthBalanceFormatted();
-      const usdcBal = await getUsdcBalanceFormatted();
-      const currentPositions = getPositions();
-      const advice = await reviewPortfolio(
-        currentPositions,
-        parseFloat(usdcBal),
-        ethBal
-      );
+    // Focused token trading
+    const focused = getFocusedToken();
+    if (!focused || !focused.active) return;
 
-      if (advice) {
-        logger.info(
-          { sentiment: advice.overallSentiment, summary: advice.summary },
-          "AI portfolio review"
-        );
-
-        // Act on AI sell/tighten-stop recommendations
-        for (const posAdvice of advice.positionAdvice) {
-          if (posAdvice.action === "sell") {
-            logger.info(
-              { symbol: posAdvice.symbol, reason: posAdvice.reasoning },
-              "AI recommends selling position"
-            );
-            // Find the position and force-sell it
-            const pos = currentPositions.find(
-              (p) => p.tokenSymbol === posAdvice.symbol
-            );
-            if (pos) {
-              await notify(
-                `🤖 <b>AI SELL: ${posAdvice.symbol}</b>\n` +
-                  `Reason: ${posAdvice.reasoning}`,
-                "HTML"
-              );
-              await forceSell(pos.tokenAddress);
-            }
-          }
-        }
-      }
-    }
-
-    // ── Step 4: Check if trading is paused ─────────────────────
-    if (isTradingPaused()) {
-      logger.info("Trading is paused — skipping buy scan");
+    const currentPrice = await getTokenPrice(focused.address as Address);
+    if (currentPrice === null) {
+      logger.warn({ token: focused.address }, "Could not fetch price — skipping tick");
       return;
     }
 
-    // ── Step 5: Check for new buy opportunities ────────────────
-    const openCount = getOpenPositionCount();
-    const availableSlots = config.maxPositions - openCount;
+    const position = getPosition(focused.address);
 
-    if (availableSlots <= 0) {
-      logger.info(
-        { positions: openCount, max: config.maxPositions },
-        "Max positions reached — skipping scan"
-      );
-      return;
-    }
-
-    // Check USDC balance
-    const usdcBalanceRaw = await getUsdcBalance();
-    const usdcBalance = parseFloat(formatUnits(usdcBalanceRaw, USDC_DECIMALS));
-
-    if (usdcBalance < config.minUsdcBalance) {
-      logger.info(
-        { usdcBalance, min: config.minUsdcBalance },
-        "USDC below minimum — skipping buys"
-      );
-      return;
-    }
-
-    // Calculate investment amount (10% of balance)
-    const investAmount = usdcBalance * (config.tradePercent / 100);
-    const investAmountStr = investAmount.toFixed(USDC_DECIMALS);
-
-    logger.info(
-      { usdcBalance, investAmount, availableSlots },
-      "Looking for buy opportunities"
-    );
-
-    // Scan DexScreener
-    const heldTokens = getHeldTokenAddresses();
-    const blacklist = getBlacklist();
-    const candidates = await scanForCandidates(heldTokens, blacklist);
-
-    if (candidates.length === 0) {
-      logger.info("No suitable candidates found this cycle");
-      return;
-    }
-
-    // ── Step 6: AI analysis of candidates ──────────────────────
-    const currentPositions = getPositions();
-    const aiVerdicts = await analyzeTokenCandidates(
-      candidates,
-      currentPositions,
-      usdcBalance
-    );
-
-    // Filter to only AI-approved buys, sorted by confidence (raised threshold for safety)
-    const approvedBuys = aiVerdicts
-      .filter((v) => v.action === "buy" && v.confidence >= 55 && v.riskLevel !== "extreme")
-      .sort((a, b) => b.confidence - a.confidence);
-
-    // Record AI rejections so these tokens are skipped in future scans
-    // unless their volume or liquidity changes meaningfully
-    const rejectedTokens = aiVerdicts
-      .filter((v) => v.action === "skip")
-      .map((v) => {
-        const c = candidates.find(
-          (c) => c.address.toLowerCase() === v.address.toLowerCase()
-        );
-        return {
-          address: v.address,
-          volume24h: c?.volume24h ?? 0,
-          liquidity: c?.liquidity ?? 0,
-        };
-      });
-    if (rejectedTokens.length > 0) {
-      recordRejections(rejectedTokens);
-      logger.info(
-        { count: rejectedTokens.length, symbols: rejectedTokens.map((r) => r.address.slice(0, 10)) },
-        "Cached AI rejections (will skip unless metrics change)"
-      );
-    }
-
-    if (approvedBuys.length === 0) {
-      logger.info("AI rejected all candidates this cycle");
-      if (isAIEnabled()) {
-        const skippedSymbols = aiVerdicts.map(
-          (v) => `${v.symbol} (${v.reasoning})`
-        );
-        logger.info({ skipped: skippedSymbols }, "AI skip reasons");
-      }
-      return;
-    }
-
-    logger.info(
-      {
-        approved: approvedBuys.length,
-        total: candidates.length,
-        aiEnabled: isAIEnabled(),
-      },
-      "Candidates filtered through AI"
-    );
-
-    // Buy AI-approved candidates (up to available slots)
-    const toBuy = approvedBuys.slice(0, availableSlots);
-
-    for (const verdict of toBuy) {
-      // Find the original candidate data
-      const candidate = candidates.find(
-        (c) => c.address.toLowerCase() === verdict.address.toLowerCase()
-      );
-      if (!candidate) continue;
-
-      // Recheck USDC balance before each buy (it decreases)
-      const currentUsdcRaw = await getUsdcBalance();
-      const currentUsdc = parseFloat(formatUnits(currentUsdcRaw, USDC_DECIMALS));
-
-      if (currentUsdc < config.minUsdcBalance) {
-        logger.info("USDC depleted below minimum, stopping buys");
-        break;
+    if (!position) {
+      // ── No open position — attempt to buy ─────────────────────
+      if (isTradingPaused()) {
+        logger.debug("Trading paused — skipping buy");
+        return;
       }
 
-      // Use AI-suggested allocation if provided, else default
-      const allocPercent = verdict.suggestedAllocPercent ?? config.tradePercent;
-      const buyAmount = (currentUsdc * (allocPercent / 100)).toFixed(
-        USDC_DECIMALS
-      );
+      if (Date.now() < reentryCooldownUntil) {
+        logger.debug(
+          { remainMs: reentryCooldownUntil - Date.now() },
+          "Re-entry cooldown active — skipping buy"
+        );
+        return;
+      }
+
+      const usdcBalRaw = await getUsdcBalance();
+      const usdcBal = parseFloat(formatUnits(usdcBalRaw, USDC_DECIMALS));
+
+      if (usdcBal < config.minUsdcBalance) {
+        logger.warn({ usdcBal, min: config.minUsdcBalance }, "USDC below minimum — skipping buy");
+        return;
+      }
+
+      const buyAmount = (usdcBal * (config.tradePercent / 100)).toFixed(USDC_DECIMALS);
 
       logger.info(
-        {
-          symbol: candidate.symbol,
-          address: candidate.address,
-          amount: buyAmount,
-          aiConfidence: verdict.confidence,
-          aiRisk: verdict.riskLevel,
-        },
-        "AI-approved buy — executing"
+        { symbol: focused.symbol, address: focused.address, amount: buyAmount, price: currentPrice },
+        "Focused token — no position, executing buy"
       );
 
       try {
-        const result = await buyToken(candidate.address, buyAmount);
+        const result: SwapResult = config.dryRun
+          ? { success: true, buyAmount: buyAmount }
+          : await buyToken(focused.address as Address, buyAmount);
 
         if (result.success) {
-          // Get the current price for position tracking
-          const price =
-            candidate.priceUsd ||
-            (await getTokenPrice(candidate.address)) ||
-            0;
-
-          const position: Position = {
-            tokenAddress: candidate.address,
-            tokenSymbol: candidate.symbol,
-            tokenName: candidate.name,
-            entryPrice: price,
-            currentPrice: price,
-            highestPrice: price,
+          const newPosition: Position = {
+            tokenAddress: focused.address,
+            tokenSymbol: focused.symbol,
+            tokenName: focused.name,
+            entryPrice: currentPrice,
+            currentPrice,
+            highestPrice: currentPrice,
             quantity: result.buyAmount ?? "0",
             usdcInvested: buyAmount,
             entryTimestamp: Date.now(),
             buyTxHash: result.txHash ?? "",
-            dexScreenerUrl: candidate.dexScreenerUrl,
+            dexScreenerUrl: focused.dexScreenerUrl ?? "",
           };
 
-          addPosition(position);
-
-          // Generate AI explanation for Telegram notification
-          const aiExplanation = await explainTrade("buy", candidate.symbol, {
-            volume24h: candidate.volume24h,
-            liquidity: candidate.liquidity,
-            priceChange1h: candidate.priceChange1h,
-            aiConfidence: verdict.confidence,
-            aiRisk: verdict.riskLevel,
-            aiReasoning: verdict.reasoning,
-          });
+          addPosition(newPosition);
 
           if (result.txHash) {
-            await notifyBuy(candidate.symbol, buyAmount, price, result.txHash);
-            if (aiExplanation) {
-              await notify(`🤖 <i>${aiExplanation}</i>`, "HTML");
-            }
+            await notifyBuy(focused.symbol, buyAmount, currentPrice, result.txHash);
+          } else if (config.dryRun) {
+            await notifyReentry(focused.symbol, buyAmount, currentPrice);
           }
 
-          logger.info(
-            { symbol: candidate.symbol, txHash: result.txHash },
-            "Buy successful"
-          );
+          if (isAIEnabled()) {
+            const explanation = await explainTrade("buy", focused.symbol, {
+              price: currentPrice,
+              stopLoss: `${focused.stopLossPercent}%`,
+              takeProfit: `${focused.takeProfitPercent}%`,
+              usdcInvested: buyAmount,
+            });
+            if (explanation) await notify(`🤖 <i>${explanation}</i>`, "HTML");
+          }
+
+          logger.info({ symbol: focused.symbol, txHash: result.txHash }, "Focused buy successful");
         } else {
-          logger.error(
-            { symbol: candidate.symbol, error: result.error },
-            "Buy failed"
-          );
-          await notifyError(
-            `Buy ${candidate.symbol}`,
-            result.error ?? "Unknown error"
-          );
+          logger.error({ error: result.error }, "Focused buy failed");
+          await notifyError(`Buy ${focused.symbol}`, result.error ?? "Unknown error");
         }
-      } catch (err) {
-        logger.error({ err, symbol: candidate.symbol }, "Buy threw exception");
-        await notifyError(`Buy ${candidate.symbol}`, String(err));
+      } catch (buyErr) {
+        logger.error({ err: buyErr }, "Buy threw exception");
+        await notifyError(`Buy ${focused.symbol}`, String(buyErr));
+      }
+    } else {
+      // ── Position open — check SL/TP ────────────────────────────
+      position.currentPrice = currentPrice;
+      if (currentPrice > position.highestPrice) {
+        position.highestPrice = currentPrice;
       }
 
-      // Small delay between buys to avoid rate limits
-      await sleep(2000);
+      const outcome = checkTpSl(
+        position,
+        focused.stopLossPercent,
+        focused.takeProfitPercent,
+        currentPrice
+      );
+
+      const slPrice = (position.entryPrice * (1 - focused.stopLossPercent / 100)).toPrecision(6);
+      const tpPrice = (position.entryPrice * (1 + focused.takeProfitPercent / 100)).toPrecision(6);
+
+      logger.debug(
+        { symbol: focused.symbol, price: currentPrice, sl: slPrice, tp: tpPrice, outcome },
+        "SL/TP check"
+      );
+
+      if (outcome === "hold") return;
+
+      // SL or TP triggered ─ sell
+      const profitPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+      const triggerLabel = outcome === "take-profit" ? "TAKE PROFIT" : "STOP LOSS";
+
+      logger.info(
+        { symbol: focused.symbol, outcome, profit: profitPercent.toFixed(2) },
+        `${triggerLabel} TRIGGERED`
+      );
+
+      const sellResult = config.dryRun
+        ? { position, result: { success: true, buyAmount: position.usdcInvested } as SwapResult }
+        : await forceSell(focused.address, outcome);
+
+      if (sellResult?.result.success) {
+        if (outcome === "take-profit") {
+          await notifyTakeProfit(
+            focused.symbol,
+            profitPercent,
+            sellResult.result.txHash ?? "",
+            currentPrice
+          );
+        } else {
+          await notifyStopLoss(focused.symbol, focused.stopLossPercent, profitPercent, true);
+        }
+
+        if (sellResult.result.txHash) {
+          await notifySell(
+            focused.symbol,
+            sellResult.result.buyAmount ?? "0",
+            currentPrice,
+            profitPercent,
+            outcome,
+            sellResult.result.txHash
+          );
+        }
+
+        reentryCooldownUntil = Date.now() + config.reentryCooldownSec * 1000;
+        logger.info({ cooldownSec: config.reentryCooldownSec }, "Re-entry cooldown started");
+      } else {
+        logger.error(
+          { error: sellResult?.result.error },
+          `${triggerLabel} sell FAILED — will retry next tick`
+        );
+      }
     }
   } catch (err) {
-    logger.error({ err }, "Trading cycle failed");
-    await notifyError("Trading cycle", String(err));
+    logger.error({ err }, "Tick error");
   } finally {
-    isRunning = false;
-    const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);
-    logger.info({ elapsed: `${elapsed}s` }, "Trading cycle complete");
+    isTicking = false;
   }
 }
 
@@ -385,131 +257,64 @@ async function checkEthBalance(): Promise<void> {
   }
 }
 
-// ── Active stop-loss monitor ────────────────────────────────────────
+// ── AI portfolio review ────────────────────────────────────────────
 
-/**
- * Lightweight loop that checks stop-losses every 10 s.
- * Runs independently of the main cron-based trading cycle.
- */
-async function stopLossMonitorTick(): Promise<void> {
-  // Skip if the main trading cycle is already evaluating stop-losses
-  if (isEvaluatingStopLoss) return;
-
-  // Nothing to monitor when there are no open positions
-  if (getOpenPositionCount() === 0) return;
-
-  isEvaluatingStopLoss = true;
+async function doPortfolioReview(): Promise<void> {
   try {
-    logger.debug("Stop-loss monitor: checking prices...");
-    const stopLossResults = await evaluateStopLosses();
+    const positions = getPositions();
+    if (positions.length === 0) return;
 
-    for (const { position, result, reason } of stopLossResults) {
-      const profitPercent =
-        ((position.currentPrice - position.entryPrice) / position.entryPrice) * 100;
-      const { trailPercent } = computeStopPrice(position);
+    const ethBal = await getEthBalanceFormatted();
+    const usdcBal = await getUsdcBalanceFormatted();
+    const advice = await reviewPortfolio(positions, parseFloat(usdcBal), ethBal);
+    if (!advice) return;
 
-      await notifyStopLoss(
-        position.tokenSymbol,
-        trailPercent,
-        profitPercent,
-        result.success
-      );
+    logger.info({ sentiment: advice.overallSentiment, summary: advice.summary }, "AI portfolio review");
 
-      if (result.success && result.txHash) {
-        await notifySell(
-          position.tokenSymbol,
-          result.buyAmount ?? "0",
-          position.currentPrice,
-          profitPercent,
-          reason,
-          result.txHash
-        );
+    for (const posAdvice of advice.positionAdvice) {
+      if (posAdvice.action === "sell") {
+        logger.info({ symbol: posAdvice.symbol, reason: posAdvice.reasoning }, "AI recommends selling");
+        const pos = positions.find((p) => p.tokenSymbol === posAdvice.symbol);
+        if (pos) {
+          await notify(`🤖 <b>AI SELL: ${posAdvice.symbol}</b>\nReason: ${posAdvice.reasoning}`, "HTML");
+          await forceSell(pos.tokenAddress, "ai-sell");
+        }
       }
     }
   } catch (err) {
-    logger.error({ err }, "Stop-loss monitor tick failed");
-  } finally {
-    isEvaluatingStopLoss = false;
-  }
-}
-
-/**
- * Start the background stop-loss monitor (10 s interval).
- */
-export function startStopLossMonitor(): void {
-  if (stopLossInterval) return; // already running
-
-  stopLossInterval = setInterval(() => {
-    stopLossMonitorTick().catch((err) => {
-      logger.error({ err }, "Stop-loss monitor unhandled error");
-    });
-  }, STOP_LOSS_POLL_MS);
-
-  logger.info(
-    { intervalMs: STOP_LOSS_POLL_MS },
-    "Active stop-loss monitor started"
-  );
-}
-
-/**
- * Stop the background stop-loss monitor.
- */
-export function stopStopLossMonitor(): void {
-  if (stopLossInterval) {
-    clearInterval(stopLossInterval);
-    stopLossInterval = null;
-    logger.info("Active stop-loss monitor stopped");
+    logger.error({ err }, "AI portfolio review failed");
   }
 }
 
 // ── Scheduler ──────────────────────────────────────────────────────
 
 /**
- * Start the trading orchestrator.
- * Runs an immediate cycle, then schedules repeats.
- * Also starts the active stop-loss monitor (10 s polling).
+ * Start the focused-token trading loop (10 s ticks).
+ * Runs an immediate tick, then polls every 10 seconds.
  */
-export function startOrchestrator(): void {
-  const intervalMin = config.scanIntervalMin;
+export function startFocusedTradingLoop(): void {
+  if (tickInterval) return; // already running
 
   logger.info(
-    { intervalMin, maxPositions: config.maxPositions, tradePercent: config.tradePercent },
-    "Starting orchestrator"
+    { tickMs: TICK_INTERVAL_MS, stopLoss: config.stopLossPercent, takeProfit: config.takeProfitPercent },
+    "Starting focused trading loop"
   );
 
-  // Start active stop-loss monitor
-  startStopLossMonitor();
+  // Fire immediately, then on interval
+  tick().catch((err) => logger.error({ err }, "Initial tick failed"));
 
-  // Run immediately on startup
-  tradingCycle().catch((err) => {
-    logger.error({ err }, "Initial trading cycle failed");
-  });
-
-  // Schedule recurring cycles
-  cronTask = cron.schedule(`*/${intervalMin} * * * *`, () => {
-    tradingCycle().catch((err) => {
-      logger.error({ err }, "Scheduled trading cycle failed");
-    });
-  });
-
-  logger.info(`Orchestrator scheduled: every ${intervalMin} minutes`);
+  tickInterval = setInterval(() => {
+    tick().catch((err) => logger.error({ err }, "Tick error"));
+  }, TICK_INTERVAL_MS);
 }
 
 /**
- * Stop the orchestrator gracefully.
+ * Stop the focused-token trading loop gracefully.
  */
-export function stopOrchestrator(): void {
-  stopStopLossMonitor();
-
-  if (cronTask) {
-    cronTask.stop();
-    cronTask = null;
-    logger.info("Orchestrator stopped");
+export function stopFocusedTradingLoop(): void {
+  if (tickInterval) {
+    clearInterval(tickInterval);
+    tickInterval = null;
+    logger.info("Focused trading loop stopped");
   }
-}
-
-// ── Utilities ──────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

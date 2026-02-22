@@ -1,8 +1,9 @@
 import { loadConfig, config } from "./config/index.js";
 import { initWallet, getWalletAddress, getEthBalanceFormatted, getUsdcBalanceFormatted } from "./chain/wallet.js";
-import { initPositionManager, saveAllState, getPositions } from "./positions/manager.js";
+import { initPositionManager, saveAllState, getPositions, getFocusedToken, setFocusedToken } from "./positions/manager.js";
+import { getTokenInfo } from "./scanner/dexscreener.js";
 import { createBot, notify } from "./telegram/bot.js";
-import { startOrchestrator, stopOrchestrator } from "./core/orchestrator.js";
+import { startFocusedTradingLoop, stopFocusedTradingLoop } from "./core/orchestrator.js";
 import { initAI, isAIEnabled } from "./ai/analyst.js";
 import { startApiServer, stopApiServer, setStartingBalance } from "./api/server.js";
 import { logger } from "./utils/logger.js";
@@ -26,7 +27,9 @@ async function main(): Promise<void> {
   loadConfig();
   logger.info(
     {
-      scanInterval: config.scanIntervalMin,
+      stopLossPercent: config.stopLossPercent,
+      takeProfitPercent: config.takeProfitPercent,
+      reentryCooldownSec: config.reentryCooldownSec,
       maxPositions: config.maxPositions,
       tradePercent: config.tradePercent,
       dryRun: config.dryRun,
@@ -53,6 +56,26 @@ async function main(): Promise<void> {
   const positions = getPositions();
   logger.info({ openPositions: positions.length }, "Positions loaded");
 
+  // 3a. Seed focused token from FOCUSED_TOKEN env var if not already set
+  if (config.focusedToken && !getFocusedToken()) {
+    logger.info({ address: config.focusedToken }, "Seeding focused token from env var...");
+    const info = await getTokenInfo(config.focusedToken);
+    if (info) {
+      setFocusedToken({
+        address: info.address,
+        symbol: info.symbol,
+        name: info.name,
+        stopLossPercent: config.stopLossPercent,
+        takeProfitPercent: config.takeProfitPercent,
+        active: true,
+        dexScreenerUrl: info.dexScreenerUrl,
+      });
+      logger.info({ symbol: info.symbol }, "Focused token set from env");
+    } else {
+      logger.warn({ address: config.focusedToken }, "Could not resolve FOCUSED_TOKEN address");
+    }
+  }
+
   // 3b. Initialize AI analyst
   logger.info("Initializing AI analyst...");
   initAI();
@@ -73,21 +96,24 @@ async function main(): Promise<void> {
   });
 
   // 5. Send startup notification
+  const focusedToken = getFocusedToken();
   await notify(
     `🐾 <b>OpenClaw Trader Started</b>\n\n` +
       `📍 Wallet: <code>${address}</code>\n` +
       `💎 ETH: ${parseFloat(ethBal).toFixed(6)}\n` +
       `💵 USDC: $${parseFloat(usdcBal).toFixed(2)}\n` +
-      `📁 Open positions: ${positions.length}/${config.maxPositions}\n` +
-      `⏱️ Scan interval: ${config.scanIntervalMin}min\n` +
-      `🤖 AI: ${isAIEnabled() ? "Claude ON" : "OFF (score-only)"}\n` +
+      `📁 Open positions: ${positions.length}\n` +
+      (focusedToken
+        ? `🎯 Focused: <b>${focusedToken.symbol}</b> (SL ${focusedToken.stopLossPercent}% / TP ${focusedToken.takeProfitPercent}%)\n`
+        : `🎯 No focused token \u2014 send a contract address to start\n`) +
+      `🤖 AI: ${isAIEnabled() ? "Claude ON" : "OFF (no API key)"}\n` +
       `${config.dryRun ? "🔧 <b>DRY RUN MODE</b>" : "🔴 <b>LIVE TRADING</b>"}`,
     "HTML"
   );
 
-  // 6. Start the trading orchestrator
-  logger.info("Starting trading orchestrator...");
-  startOrchestrator();
+  // 6. Start the focused trading loop
+  logger.info("Starting focused trading loop...");
+  startFocusedTradingLoop();
 
   logger.info("═══════════════════════════════════════════");
   logger.info("OpenClaw Trader is fully operational!");
@@ -98,7 +124,7 @@ async function main(): Promise<void> {
 function shutdown(signal: string): void {
   logger.info({ signal }, "Shutting down...");
 
-  stopOrchestrator();
+  stopFocusedTradingLoop();
   stopApiServer();
   saveAllState();
 
