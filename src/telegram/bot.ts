@@ -12,16 +12,17 @@ import {
   isTradingPaused,
   setPaused,
   forceSell,
+  forceSellByAddress,
   addToBlacklist,
-  computeStopPrice,
-  getFocusedToken,
-  setFocusedToken,
-  clearFocusedToken,
-  type Position,
+  getMonitors,
+  getActiveMonitors,
+  addMonitor,
+  removeMonitor,
+  clearAllMonitors,
+  type MonitoredToken,
   type TradeHistoryEntry,
 } from "../positions/manager.js";
 import { getTokenInfo } from "../scanner/dexscreener.js";
-import { processNaturalLanguage, type BotState } from "../ai/analyst.js";
 import { logger } from "../utils/logger.js";
 
 // ── Bot instance ───────────────────────────────────────────────────
@@ -49,169 +50,119 @@ export function createBot(): Bot {
 
   // ── Commands ──────────────────────────────────────────────────
   bot.command("start", async (ctx) => {
-    const focused = getFocusedToken();
-    const focusedLine = focused
-      ? `\n\n🎯 <b>Focused token:</b> <code>${focused.symbol}</code> ` +
-        `• SL ${focused.stopLossPercent}% • TP ${focused.takeProfitPercent}%`
-      : "\n\nNo focused token yet.";
+    const monitors = getActiveMonitors();
+    const monitorLine = monitors.length > 0
+      ? `\n\n📡 <b>Active monitors:</b> ${monitors.map((m) => m.symbol).join(", ")}`
+      : "\n\nNo active monitors.";
 
     await ctx.reply(
-      `🐾 <b>OpenClaw Trader</b> is running!${focusedLine}\n\n` +
-        `<b>Slash commands:</b>\n` +
-        `/status — Overview (balances, focused token, positions)\n` +
-        `/portfolio — Detailed position info with P&L\n` +
+      `🐾 <b>OpenClaw Trader</b> is running!${monitorLine}\n\n` +
+        `<b>How to use:</b>\n` +
+        `Send a message in this format to start monitoring:\n` +
+        `<code>&lt;contract_address&gt; &lt;stop_loss_price&gt;</code>\n\n` +
+        `<b>Example:</b>\n` +
+        `<code>0x1234...abcd 0.005</code>\n\n` +
+        `<b>Commands:</b>\n` +
+        `/status — Overview (balances, monitors)\n` +
+        `/monitors — List all active monitors\n` +
         `/balance — ETH + USDC balances\n` +
         `/history — Last 10 trades\n` +
-        `/pause — Pause trading\n` +
-        `/resume — Resume trading\n` +
-        `/sell &lt;address&gt; — Force-sell a position\n` +
-        `/blacklist &lt;address&gt; — Blacklist a token\n\n` +
-        `<b>Natural language examples:</b>\n` +
-        `• "Trade 0x1234... with 8% SL and 25% TP"\n` +
-        `• "Set take-profit to 30%"\n` +
-        `• "Stop the current trade"\n` +
-        `• "What's my current P&L?"`,
+        `/stop &lt;address&gt; — Stop monitoring a token\n` +
+        `/stopall — Stop all monitors\n` +
+        `/sell &lt;address&gt; — Force-sell a token\n` +
+        `/pause — Pause all monitoring\n` +
+        `/resume — Resume monitoring`,
       { parse_mode: "HTML" }
     );
   });
 
   bot.command("status", handleStatus);
-  bot.command("portfolio", handlePortfolio);
+  bot.command("monitors", handleMonitors);
   bot.command("balance", handleBalance);
   bot.command("history", handleHistory);
   bot.command("pause", handlePause);
   bot.command("resume", handleResume);
   bot.command("sell", handleSell);
-  bot.command("blacklist", handleBlacklist);
+  bot.command("stop", handleStop);
+  bot.command("stopall", handleStopAll);
 
-  // ── Natural language handler ───────────────────────────────
+  // ── Text message handler: parse "<address> <stop_loss_price>" ──
   bot.on("message:text", async (ctx) => {
-    // Skip if this looks like a command (already handled above)
-    const text = ctx.message.text ?? "";
+    const text = ctx.message.text?.trim() ?? "";
     if (text.startsWith("/")) return;
 
-    try {
-      const [ethBal, usdcBal] = await Promise.all([
-        getEthBalanceFormatted().catch(() => "?"),
-        getUsdcBalanceFormatted().catch(() => "?"),
-      ]);
-
-      const focused = getFocusedToken();
-      const positions = getPositions();
-
-      const state: BotState = {
-        focusedToken: focused
-          ? {
-              address: focused.address,
-              symbol: focused.symbol,
-              stopLossPercent: focused.stopLossPercent,
-              takeProfitPercent: focused.takeProfitPercent,
-              active: focused.active,
-            }
-          : null,
-        openPositions: positions.map((p) => ({
-          symbol: p.tokenSymbol,
-          address: p.tokenAddress,
-          entryPrice: p.entryPrice,
-          currentPrice: p.currentPrice,
-          profitPercent: ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100,
-          holdTimeHours: (Date.now() - p.entryTimestamp) / (1000 * 60 * 60),
-        })),
-        usdcBalance: parseFloat(usdcBal),
-        ethBalance: ethBal,
-        paused: isTradingPaused(),
-      };
-
-      const action = await processNaturalLanguage(text, state);
-
-      switch (action.type) {
-        case "set_token": {
-          // Fetch token info from DexScreener
-          const info = await getTokenInfo(action.address);
-          if (!info) {
-            await ctx.reply(`❌ Could not find token <code>${action.address}</code> on Base. Please verify the contract address.`, { parse_mode: "HTML" });
-            return;
-          }
-          setFocusedToken({
-            address: info.address,
-            symbol: info.symbol,
-            name: info.name,
-            stopLossPercent: action.stopLossPercent ?? config.stopLossPercent,
-            takeProfitPercent: action.takeProfitPercent ?? config.takeProfitPercent,
-            active: true,
-            dexScreenerUrl: info.dexScreenerUrl,
-          });
-          await ctx.reply(
-            `✅ <b>Focused on ${info.symbol}</b>\n` +
-              `📍Address: <code>${info.address}</code>\n` +
-              `📉 Stop-loss: ${action.stopLossPercent ?? config.stopLossPercent}%\n` +
-              `📈 Take-profit: ${action.takeProfitPercent ?? config.takeProfitPercent}%\n` +
-              `🔄 Auto re-entry after SL/TP: enabled\n\n` +
-              `${action.reply}`,
-            { parse_mode: "HTML" }
-          );
-          break;
-        }
-        case "set_sl_tp": {
-          const current = getFocusedToken();
-          if (!current) {
-            await ctx.reply("❌ No focused token is set. Please specify a token address first.");
-            return;
-          }
-          setFocusedToken({
-            ...current,
-            stopLossPercent: action.stopLossPercent ?? current.stopLossPercent,
-            takeProfitPercent: action.takeProfitPercent ?? current.takeProfitPercent,
-          });
-          const updated = getFocusedToken()!;
-          await ctx.reply(
-            `✅ <b>${updated.symbol}</b> levels updated\n` +
-              `📉 SL: ${updated.stopLossPercent}% • 📈 TP: ${updated.takeProfitPercent}%\n\n` +
-              `${action.reply}`,
-            { parse_mode: "HTML" }
-          );
-          break;
-        }
-        case "stop_token":
-          clearFocusedToken();
-          await ctx.reply(`⏹️ Trading stopped. ${action.reply}`);
-          break;
-        case "pause":
-          setPaused(true);
-          await ctx.reply(`⏸️ Trading paused. ${action.reply}`);
-          break;
-        case "resume":
-          setPaused(false);
-          await ctx.reply(`▶️ Trading resumed. ${action.reply}`);
-          break;
-        case "force_sell": {
-          const pos = getPositions()[0];
-          if (!pos) {
-            await ctx.reply("❌ No open positions to sell.");
-            return;
-          }
-          await ctx.reply(`⏳ Selling ${pos.tokenSymbol}...`);
-          const result = await forceSell(pos.tokenAddress, "manual");
-          if (result?.result.success) {
-            const pl = ((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-            await ctx.reply(
-              `✅ Sold <b>${pos.tokenSymbol}</b>\nP&L: ${pl >= 0 ? "+" : ""}${pl.toFixed(2)}%\n\n${action.reply}`,
-              { parse_mode: "HTML" }
-            );
-          } else {
-            await ctx.reply(`❌ Sell failed: ${result?.result.error ?? "Unknown"}`);
-          }
-          break;
-        }
-        case "query":
-        case "unknown":
-        default:
-          await ctx.reply(action.reply);
-      }
-    } catch (err) {
-      logger.error({ err }, "NL message handler error");
-      await ctx.reply("❌ Something went wrong processing your message. Please try a slash command like /status.");
+    // Expected format: <contract_address> <stop_loss_price>
+    const match = text.match(/^(0x[a-fA-F0-9]{40})\s+([\d.]+)$/);
+    if (!match) {
+      await ctx.reply(
+        `❌ Invalid format.\n\n` +
+          `Please send in this format:\n` +
+          `<code>&lt;contract_address&gt; &lt;stop_loss_price&gt;</code>\n\n` +
+          `Example:\n<code>0x1234abcd...5678 0.005</code>`,
+        { parse_mode: "HTML" }
+      );
+      return;
     }
+
+    const contractAddress = match[1];
+    const stopLossPrice = parseFloat(match[2]);
+
+    if (isNaN(stopLossPrice) || stopLossPrice <= 0) {
+      await ctx.reply("❌ Invalid stop-loss price. Please provide a positive number.");
+      return;
+    }
+
+    // Fetch token info
+    await ctx.reply("⏳ Looking up token...");
+    const info = await getTokenInfo(contractAddress);
+    if (!info) {
+      await ctx.reply(
+        `❌ Could not find token <code>${contractAddress}</code> on Base.\nPlease verify the contract address.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (info.priceUsd <= 0) {
+      await ctx.reply(`❌ Could not get current price for <b>${info.symbol}</b>. Try again later.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    if (stopLossPrice >= info.priceUsd) {
+      await ctx.reply(
+        `⚠️ Stop-loss price ($${stopLossPrice}) is above or equal to current price ($${info.priceUsd.toPrecision(6)}).\n` +
+        `This would trigger an immediate sell. Please set a stop-loss below current price.`,
+      );
+      return;
+    }
+
+    // Add the monitor
+    const monitor: MonitoredToken = {
+      address: info.address,
+      symbol: info.symbol,
+      name: info.name,
+      stopLossPrice,
+      entryPrice: info.priceUsd,
+      lastNotifiedMilestone: 0,
+      active: true,
+      dexScreenerUrl: info.dexScreenerUrl,
+      addedAt: Date.now(),
+    };
+
+    addMonitor(monitor);
+
+    const slPercent = ((info.priceUsd - stopLossPrice) / info.priceUsd * 100).toFixed(1);
+
+    await ctx.reply(
+      `✅ <b>Monitoring ${info.symbol}</b>\n\n` +
+        `📍 Address: <code>${info.address}</code>\n` +
+        `💵 Current price: $${info.priceUsd.toPrecision(6)}\n` +
+        `🛑 Stop-loss: $${stopLossPrice} (${slPercent}% below current)\n` +
+        `📊 Milestones: every +25% from entry\n` +
+        `⏱️ Checking every ${config.monitorIntervalSec}s\n\n` +
+        `${config.dryRun ? "🔧 <b>DRY RUN MODE</b> — sells won't execute" : "🔴 <b>LIVE MODE</b> — will auto-sell on stop-loss"}`,
+      { parse_mode: "HTML" }
+    );
   });
 
   // Register error handler
@@ -242,19 +193,59 @@ export async function notify(message: string, parseMode?: "HTML" | "MarkdownV2")
   }
 }
 
-/** Notify about a completed buy */
-export async function notifyBuy(
+/** Notify about a stop-loss trigger */
+export async function notifyStopLossHit(
   symbol: string,
-  usdcAmount: string,
-  price: number,
-  txHash: string
+  currentPrice: number,
+  stopLossPrice: number,
+  lossPercent: number,
+  txHash: string,
+  sellSuccess: boolean
 ): Promise<void> {
-  const basescanLink = `https://basescan.org/tx/${txHash}`;
+  const basescanLink = txHash ? `\n🔗 <a href="https://basescan.org/tx/${txHash}">View on BaseScan</a>` : "";
+  const status = sellSuccess ? "✅ Sold successfully" : "❌ Sell FAILED — will retry";
   await notify(
-    `🟢 <b>BUY ${symbol}</b>\n` +
-      `💰 Spent: $${usdcAmount} USDC\n` +
-      `💵 Price: $${price.toPrecision(6)}\n` +
-      `🔗 <a href="${basescanLink}">View on BaseScan</a>`,
+    `🛑 <b>STOP-LOSS HIT: ${symbol}</b>\n\n` +
+      `💵 Price: $${currentPrice.toPrecision(6)}\n` +
+      `🎯 Stop-loss was: $${stopLossPrice}\n` +
+      `📉 Change from entry: ${lossPercent >= 0 ? "+" : ""}${lossPercent.toFixed(1)}%\n` +
+      `${status}` +
+      basescanLink,
+    "HTML"
+  );
+}
+
+/** Notify about a 25% price milestone */
+export async function notifyMilestone(
+  symbol: string,
+  currentPrice: number,
+  entryPrice: number,
+  milestonePercent: number
+): Promise<void> {
+  const gainPercent = ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1);
+  await notify(
+    `🚀 <b>${symbol} +${milestonePercent}% MILESTONE</b>\n\n` +
+      `💵 Current price: $${currentPrice.toPrecision(6)}\n` +
+      `📈 Entry price: $${entryPrice.toPrecision(6)}\n` +
+      `📊 Gain: +${gainPercent}%`,
+    "HTML"
+  );
+}
+
+/** Notify low ETH warning */
+export async function notifyLowEth(balance: string): Promise<void> {
+  await notify(
+    `⚠️ <b>LOW ETH WARNING</b>\n\n` +
+      `Current balance: ${balance} ETH\n\n` +
+      `Please top up ETH on Base to continue trading.`,
+    "HTML"
+  );
+}
+
+/** Notify about an error */
+export async function notifyError(context: string, error: string): Promise<void> {
+  await notify(
+    `❌ <b>ERROR</b>: ${context}\n\n<code>${escapeHtml(error.slice(0, 500))}</code>`,
     "HTML"
   );
 }
@@ -270,7 +261,6 @@ export async function notifySell(
 ): Promise<void> {
   const emoji = profitPercent >= 0 ? "🟢" : "🔴";
   const basescanLink = `https://basescan.org/tx/${txHash}`;
-  // usdcReceived comes from 0x API buyAmount which is in raw units (6 decimals)
   const usdcFormatted = parseFloat(formatUnits(BigInt(usdcReceived), USDC_DECIMALS)).toFixed(2);
   await notify(
     `${emoji} <b>SELL ${symbol}</b> (${reason})\n` +
@@ -278,73 +268,6 @@ export async function notifySell(
       `💵 Price: $${price.toPrecision(6)}\n` +
       `📊 P&L: ${profitPercent >= 0 ? "+" : ""}${profitPercent.toFixed(2)}%\n` +
       `🔗 <a href="${basescanLink}">View on BaseScan</a>`,
-    "HTML"
-  );
-}
-
-/** Notify low ETH warning */
-export async function notifyLowEth(balance: string): Promise<void> {
-  await notify(
-    `⚠️ <b>LOW ETH WARNING</b>\n\n` +
-      `Current balance: ${balance} ETH\n` +
-      `Threshold: ${config.ethWarnThreshold.toString()} wei\n\n` +
-      `Please top up ETH on Base to continue trading.`,
-    "HTML"
-  );
-}
-
-/** Notify about an error */
-export async function notifyError(context: string, error: string): Promise<void> {
-  await notify(
-    `❌ <b>ERROR</b>: ${context}\n\n<code>${escapeHtml(error.slice(0, 500))}</code>`,
-    "HTML"
-  );
-}
-
-/** Notify about a stop-loss trigger */
-export async function notifyStopLoss(
-  symbol: string,
-  stopLossPercent: number,
-  profitPercent: number,
-  sellSuccess: boolean
-): Promise<void> {
-  const status = sellSuccess ? "✅ Sold successfully" : "❌ Sell failed — will retry";
-  await notify(
-    `🛑 <b>STOP-LOSS: ${symbol}</b>\n` +
-      `📉 Triggered at ${stopLossPercent}% below entry\n` +
-      `📊 P&L at exit: ${profitPercent >= 0 ? "+" : ""}${profitPercent.toFixed(1)}%\n` +
-      `${status}`,
-    "HTML"
-  );
-}
-
-/** Notify about a take-profit trigger */
-export async function notifyTakeProfit(
-  symbol: string,
-  profitPercent: number,
-  txHash: string,
-  price: number
-): Promise<void> {
-  const basescanLink = txHash && txHash !== "DRY_RUN" ? `\n🔗 <a href="https://basescan.org/tx/${txHash}">View on BaseScan</a>` : "";
-  await notify(
-    `🎉 <b>TAKE-PROFIT: ${symbol}</b>\n` +
-      `📊 Profit: +${profitPercent.toFixed(2)}%\n` +
-      `💵 Exit price: $${price.toPrecision(6)}` +
-      basescanLink,
-    "HTML"
-  );
-}
-
-/** Notify about an automatic re-entry after SL/TP */
-export async function notifyReentry(
-  symbol: string,
-  usdcAmount: string,
-  price: number
-): Promise<void> {
-  await notify(
-    `🔄 <b>RE-ENTRY: ${symbol}</b>\n` +
-      `💰 Invested: $${usdcAmount} USDC\n` +
-      `💵 Price: $${price.toPrecision(6)}`,
     "HTML"
   );
 }
@@ -357,34 +280,28 @@ async function handleStatus(ctx: Context): Promise<void> {
       getEthBalanceFormatted(),
       getUsdcBalanceFormatted(),
     ]);
-    const positions = getPositions();
+    const monitors = getActiveMonitors();
     const paused = isTradingPaused();
-    const focused = getFocusedToken();
 
-    const focusedBlock = focused
-      ? `🎯 <b>Focused Token:</b> <code>${focused.symbol}</code>\n` +
-        `   📍 <code>${focused.address}</code>\n` +
-        `   📉 SL: ${focused.stopLossPercent}% • 📈 TP: ${focused.takeProfitPercent}%\n` +
-        `   Status: ${focused.active ? (paused ? "⏸️ Paused" : "🟢 Active") : "❌ Inactive"}\n\n`
-      : `🎯 No focused token. Use natural language to set one.\n\n`;
-
-    const positionSummary =
-      positions.length === 0
-        ? "No open positions"
-        : positions
-            .map((p) => {
-              const pl = ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100;
-              const emoji = pl >= 0 ? "🟢" : "🔴";
-              return `${emoji} ${p.tokenSymbol}: $${p.currentPrice.toPrecision(4)} (${pl >= 0 ? "+" : ""}${pl.toFixed(1)}%)`;
-            })
-            .join("\n");
+    let monitorBlock: string;
+    if (monitors.length === 0) {
+      monitorBlock = "📡 No active monitors.\nSend <code>&lt;address&gt; &lt;price&gt;</code> to start.\n";
+    } else {
+      monitorBlock = "📡 <b>Active Monitors:</b>\n" +
+        monitors.map((m) => {
+          const slPercent = ((m.entryPrice - m.stopLossPrice) / m.entryPrice * 100).toFixed(1);
+          return `  • <b>${m.symbol}</b> — SL: $${m.stopLossPrice} (${slPercent}% below entry $${m.entryPrice.toPrecision(6)})`;
+        }).join("\n") + "\n";
+    }
 
     await ctx.reply(
       `📊 <b>OpenClaw Status</b>\n\n` +
         `💎 ETH: ${parseFloat(ethBal).toFixed(6)}\n` +
         `💵 USDC: $${parseFloat(usdcBal).toFixed(2)}\n\n` +
-        focusedBlock +
-        `<b>Positions:</b>\n${positionSummary}`,
+        monitorBlock + "\n" +
+        `⏱️ Check interval: ${config.monitorIntervalSec}s\n` +
+        `Status: ${paused ? "⏸️ Paused" : "🟢 Active"}\n` +
+        `${config.dryRun ? "🔧 DRY RUN" : "🔴 LIVE"}`,
       { parse_mode: "HTML" }
     );
   } catch (err) {
@@ -393,54 +310,32 @@ async function handleStatus(ctx: Context): Promise<void> {
   }
 }
 
-async function handlePortfolio(ctx: Context): Promise<void> {
-  try {
-    const positions = getPositions();
-    if (positions.length === 0) {
-      await ctx.reply("📭 No open positions.");
-      return;
-    }
-
-    const focused = getFocusedToken();
-    let msg = "📋 <b>Portfolio Details</b>\n\n";
-
-    for (const p of positions) {
-      const currentPl = ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100;
-      const holdTime = timeSince(p.entryTimestamp);
-      const emoji = currentPl >= 0 ? "🟢" : "🔴";
-
-      // Use flat SL/TP from focused config if this is the focused token
-      const isFocused = focused && focused.address.toLowerCase() === p.tokenAddress.toLowerCase();
-      let slLine: string;
-      let tpLine: string;
-      if (isFocused) {
-        const slPrice = p.entryPrice * (1 - focused.stopLossPercent / 100);
-        const tpPrice = p.entryPrice * (1 + focused.takeProfitPercent / 100);
-        slLine = `   📉 SL: $${slPrice.toPrecision(4)} (${focused.stopLossPercent}% below entry)\n`;
-        tpLine = `   📈 TP: $${tpPrice.toPrecision(4)} (${focused.takeProfitPercent}% above entry)\n`;
-      } else {
-        const { stopPrice, trailPercent } = computeStopPrice(p);
-        slLine = `   📉 Stop: $${stopPrice.toPrecision(4)} (${trailPercent}% trail)\n`;
-        tpLine = "";
-      }
-
-      msg +=
-        `${emoji} <b>${p.tokenSymbol}</b>\n` +
-        `   Entry: $${p.entryPrice.toPrecision(4)}\n` +
-        `   Current: $${p.currentPrice.toPrecision(4)}\n` +
-        `   Peak: $${p.highestPrice.toPrecision(4)}\n` +
-        `   P&L: ${currentPl >= 0 ? "+" : ""}${currentPl.toFixed(2)}%\n` +
-        slLine +
-        tpLine +
-        `   Invested: $${p.usdcInvested}\n` +
-        `   Held: ${holdTime}\n\n`;
-    }
-
-    await ctx.reply(msg, { parse_mode: "HTML" });
-  } catch (err) {
-    logger.error({ err }, "Error in /portfolio");
-    await ctx.reply("❌ Failed to fetch portfolio.");
+async function handleMonitors(ctx: Context): Promise<void> {
+  const monitors = getMonitors();
+  if (monitors.length === 0) {
+    await ctx.reply("📭 No active monitors.\n\nSend <code>&lt;address&gt; &lt;stop_loss_price&gt;</code> to start monitoring.", { parse_mode: "HTML" });
+    return;
   }
+
+  let msg = "📡 <b>Active Monitors</b>\n\n";
+  for (const m of monitors) {
+    const slPercent = m.entryPrice > 0
+      ? ((m.entryPrice - m.stopLossPrice) / m.entryPrice * 100).toFixed(1)
+      : "?";
+    const status = m.active ? "🟢 Active" : "❌ Inactive";
+    const held = timeSince(m.addedAt);
+
+    msg +=
+      `<b>${m.symbol}</b> ${status}\n` +
+      `   📍 <code>${m.address}</code>\n` +
+      `   💵 Entry: $${m.entryPrice.toPrecision(6)}\n` +
+      `   🛑 SL: $${m.stopLossPrice} (${slPercent}% below)\n` +
+      `   📊 Last milestone: +${m.lastNotifiedMilestone}%\n` +
+      `   ⏱️ Monitoring for: ${held}\n\n`;
+  }
+
+  msg += `Use /stop &lt;address&gt; to remove a monitor.`;
+  await ctx.reply(msg, { parse_mode: "HTML" });
 }
 
 async function handleBalance(ctx: Context): Promise<void> {
@@ -487,72 +382,110 @@ async function handleHistory(ctx: Context): Promise<void> {
 
 async function handlePause(ctx: Context): Promise<void> {
   setPaused(true);
-  await ctx.reply("⏸️ Trading has been <b>PAUSED</b>. Use /resume to restart.", {
+  await ctx.reply("⏸️ Monitoring has been <b>PAUSED</b>. Use /resume to restart.", {
     parse_mode: "HTML",
   });
 }
 
 async function handleResume(ctx: Context): Promise<void> {
   setPaused(false);
-  await ctx.reply("▶️ Trading has been <b>RESUMED</b>.", { parse_mode: "HTML" });
+  await ctx.reply("▶️ Monitoring has been <b>RESUMED</b>.", { parse_mode: "HTML" });
 }
 
 async function handleSell(ctx: Context): Promise<void> {
   const text = ctx.message?.text ?? "";
   const parts = text.split(/\s+/);
   if (parts.length < 2) {
-    // Show list of positions to sell
-    const positions = getPositions();
-    if (positions.length === 0) {
-      await ctx.reply("📭 No positions to sell.");
+    const monitors = getActiveMonitors();
+    if (monitors.length === 0) {
+      await ctx.reply("📭 No monitored tokens to sell.");
       return;
     }
-    let msg = "Usage: /sell <token_address>\n\nOpen positions:\n";
-    for (const p of positions) {
-      msg += `• ${p.tokenSymbol}: <code>${p.tokenAddress}</code>\n`;
+    let msg = "Usage: /sell <token_address>\n\nMonitored tokens:\n";
+    for (const m of monitors) {
+      msg += `• ${m.symbol}: <code>${m.address}</code>\n`;
     }
     await ctx.reply(msg, { parse_mode: "HTML" });
     return;
   }
 
   const tokenAddress = parts[1].trim();
-  await ctx.reply(`⏳ Selling ${tokenAddress}...`);
+  await ctx.reply(`⏳ Selling all ${tokenAddress}...`);
 
-  const result = await forceSell(tokenAddress);
-  if (!result) {
-    await ctx.reply("❌ No open position found for that token.");
+  // Try position-based sell first
+  const posResult = await forceSell(tokenAddress);
+  if (posResult) {
+    if (posResult.result.success) {
+      const pl =
+        ((posResult.position.currentPrice - posResult.position.entryPrice) /
+          posResult.position.entryPrice) *
+        100;
+      await ctx.reply(
+        `✅ Sold <b>${posResult.position.tokenSymbol}</b>\n` +
+          `P&L: ${pl >= 0 ? "+" : ""}${pl.toFixed(2)}%\n` +
+          `TX: ${posResult.result.txHash ?? "N/A"}`,
+        { parse_mode: "HTML" }
+      );
+    } else {
+      await ctx.reply(`❌ Sell failed: ${posResult.result.error}`);
+    }
     return;
   }
 
-  if (result.result.success) {
-    const pl =
-      ((result.position.currentPrice - result.position.entryPrice) /
-        result.position.entryPrice) *
-      100;
+  // Try monitor-based sell
+  const monitor = getMonitors().find(
+    (m) => m.address.toLowerCase() === tokenAddress.toLowerCase()
+  );
+  const symbol = monitor?.symbol ?? "token";
+  const result = await forceSellByAddress(tokenAddress, symbol, "manual");
+  if (result.success) {
+    // Also remove the monitor
+    removeMonitor(tokenAddress);
     await ctx.reply(
-      `✅ Sold <b>${result.position.tokenSymbol}</b>\n` +
-        `P&L: ${pl >= 0 ? "+" : ""}${pl.toFixed(2)}%\n` +
-        `TX: ${result.result.txHash ?? "N/A"}`,
+      `✅ Sold all <b>${symbol}</b>\nTX: ${result.txHash ?? "N/A"}`,
       { parse_mode: "HTML" }
     );
   } else {
-    await ctx.reply(`❌ Sell failed: ${result.result.error}`);
+    await ctx.reply(`❌ Sell failed: ${result.error}`);
   }
 }
 
-async function handleBlacklist(ctx: Context): Promise<void> {
+async function handleStop(ctx: Context): Promise<void> {
   const text = ctx.message?.text ?? "";
   const parts = text.split(/\s+/);
   if (parts.length < 2) {
-    await ctx.reply("Usage: /blacklist <token_address>");
+    const monitors = getActiveMonitors();
+    if (monitors.length === 0) {
+      await ctx.reply("📭 No active monitors to stop.");
+      return;
+    }
+    let msg = "Usage: /stop <token_address>\n\nActive monitors:\n";
+    for (const m of monitors) {
+      msg += `• ${m.symbol}: <code>${m.address}</code>\n`;
+    }
+    msg += "\nOr use /stopall to stop all monitors.";
+    await ctx.reply(msg, { parse_mode: "HTML" });
     return;
   }
 
   const tokenAddress = parts[1].trim();
-  addToBlacklist(tokenAddress);
-  await ctx.reply(`🚫 Token <code>${tokenAddress}</code> has been blacklisted.`, {
-    parse_mode: "HTML",
-  });
+  const removed = removeMonitor(tokenAddress);
+  if (removed) {
+    await ctx.reply(`⏹️ Stopped monitoring <b>${removed.symbol}</b>`, { parse_mode: "HTML" });
+  } else {
+    await ctx.reply(`❌ No monitor found for <code>${tokenAddress}</code>`, { parse_mode: "HTML" });
+  }
+}
+
+async function handleStopAll(ctx: Context): Promise<void> {
+  const monitors = getActiveMonitors();
+  if (monitors.length === 0) {
+    await ctx.reply("📭 No active monitors to stop.");
+    return;
+  }
+  const count = monitors.length;
+  clearAllMonitors();
+  await ctx.reply(`⏹️ Stopped all <b>${count}</b> monitor(s).`, { parse_mode: "HTML" });
 }
 
 // ── Utilities ──────────────────────────────────────────────────────

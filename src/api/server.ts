@@ -3,6 +3,7 @@ import { config } from "../config/index.js";
 import {
   getPositions,
   getFullHistory,
+  getActiveMonitors,
   isTradingPaused,
   type Position,
   type TradeHistoryEntry,
@@ -12,7 +13,6 @@ import {
   getUsdcBalanceFormatted,
   getWalletAddress,
 } from "../chain/wallet.js";
-import { isAIEnabled } from "../ai/analyst.js";
 import { logger } from "../utils/logger.js";
 
 // ── State (set once on startup) ────────────────────────────────────
@@ -83,10 +83,10 @@ async function handleStatus(_req: IncomingMessage, res: ServerResponse): Promise
     estimatedPnlUsdc: round(pnlUsdc),
     estimatedPnlPercent: round(pnlPercent),
     openPositions: positions.length,
+    activeMonitors: getActiveMonitors().length,
     maxPositions: config.maxPositions,
     totalTrades: history.length,
     paused: isTradingPaused(),
-    aiEnabled: isAIEnabled(),
     dryRun: config.dryRun,
   });
 }

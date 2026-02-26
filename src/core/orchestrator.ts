@@ -1,59 +1,43 @@
-import { formatUnits, type Address } from "viem";
-import { config, USDC_DECIMALS } from "../config/index.js";
+import { type Address } from "viem";
+import { config } from "../config/index.js";
 import {
   getEthBalance,
   getEthBalanceFormatted,
-  getUsdcBalance,
-  getUsdcBalanceFormatted,
 } from "../chain/wallet.js";
 import { getTokenPrice } from "../scanner/dexscreener.js";
-import { buyToken, type SwapResult } from "../swap/executor.js";
 import {
-  getPositions,
-  isTradingPaused,
-  addPosition,
-  checkTpSl,
-  getFocusedToken,
-  getPosition,
-  forceSell,
-  type Position,
+  getActiveMonitors,
+  updateMonitor,
+  removeMonitor,
+  forceSellByAddress,
+  type MonitoredToken,
 } from "../positions/manager.js";
 import {
   notify,
-  notifyBuy,
-  notifySell,
-  notifyLowEth,
+  notifyStopLossHit,
   notifyError,
-  notifyStopLoss,
-  notifyTakeProfit,
-  notifyReentry,
+  notifyLowEth,
+  notifyMilestone,
 } from "../telegram/bot.js";
-import {
-  reviewPortfolio,
-  explainTrade,
-  isAIEnabled,
-} from "../ai/analyst.js";
 import { logger } from "../utils/logger.js";
 
 // ── State ──────────────────────────────────────────────────────────
 
-const TICK_INTERVAL_MS = 10_000;  // 10 seconds
-const ETH_CHECK_TICKS = 6;        // Every 6 ticks = 60 seconds
-const PORTFOLIO_REVIEW_TICKS = 60; // Every 60 ticks = ~10 minutes
+const ETH_CHECK_INTERVAL = 10; // Check ETH every N ticks (10 * 30s = 5 min)
 
 let tickInterval: ReturnType<typeof setInterval> | null = null;
 let tickCount = 0;
-let isTicking = false;            // Guard against overlapping ticks
-let lastEthWarning = 0;           // Debounce: warn at most once per hour
-let reentryCooldownUntil = 0;     // Don't re-buy until this timestamp
+let isTicking = false;
+let lastEthWarning = 0;
 
-// ── Focused token tick ─────────────────────────────────────────────
+// ── Core monitor tick ──────────────────────────────────────────────
 
 /**
- * Core trading tick — runs every 10 seconds.
- *  1. Periodic ETH balance check
- *  2. Periodic AI portfolio review
- *  3. Focused-token buy/SL/TP loop
+ * Core monitoring tick — runs every 30 seconds.
+ * For each active monitor:
+ *   1. Fetch current price
+ *   2. If price <= stopLossPrice → sell all holdings, deactivate monitor
+ *   3. Check for 25% price increase milestones → notify on Telegram
  */
 async function tick(): Promise<void> {
   if (isTicking) return;
@@ -62,177 +46,111 @@ async function tick(): Promise<void> {
 
   try {
     // Periodic ETH balance check
-    if (tickCount % ETH_CHECK_TICKS === 0) {
+    if (tickCount % ETH_CHECK_INTERVAL === 0) {
       await checkEthBalance();
     }
 
-    // Periodic AI portfolio review
-    if (tickCount % PORTFOLIO_REVIEW_TICKS === 0 && isAIEnabled()) {
-      await doPortfolioReview();
-    }
+    const monitors = getActiveMonitors();
+    if (monitors.length === 0) return;
 
-    // Focused token trading
-    const focused = getFocusedToken();
-    if (!focused || !focused.active) return;
-
-    const currentPrice = await getTokenPrice(focused.address as Address);
-    if (currentPrice === null) {
-      logger.warn({ token: focused.address }, "Could not fetch price — skipping tick");
-      return;
-    }
-
-    const position = getPosition(focused.address);
-
-    if (!position) {
-      // ── No open position — attempt to buy ─────────────────────
-      if (isTradingPaused()) {
-        logger.debug("Trading paused — skipping buy");
-        return;
-      }
-
-      if (Date.now() < reentryCooldownUntil) {
-        logger.debug(
-          { remainMs: reentryCooldownUntil - Date.now() },
-          "Re-entry cooldown active — skipping buy"
-        );
-        return;
-      }
-
-      const usdcBalRaw = await getUsdcBalance();
-      const usdcBal = parseFloat(formatUnits(usdcBalRaw, USDC_DECIMALS));
-
-      if (usdcBal < config.minUsdcBalance) {
-        logger.warn({ usdcBal, min: config.minUsdcBalance }, "USDC below minimum — skipping buy");
-        return;
-      }
-
-      const buyAmount = (usdcBal * (config.tradePercent / 100)).toFixed(USDC_DECIMALS);
-
-      logger.info(
-        { symbol: focused.symbol, address: focused.address, amount: buyAmount, price: currentPrice },
-        "Focused token — no position, executing buy"
-      );
-
+    for (const monitor of monitors) {
       try {
-        const result: SwapResult = config.dryRun
-          ? { success: true, buyAmount: buyAmount }
-          : await buyToken(focused.address as Address, buyAmount);
-
-        if (result.success) {
-          const newPosition: Position = {
-            tokenAddress: focused.address,
-            tokenSymbol: focused.symbol,
-            tokenName: focused.name,
-            entryPrice: currentPrice,
-            currentPrice,
-            highestPrice: currentPrice,
-            quantity: result.buyAmount ?? "0",
-            usdcInvested: buyAmount,
-            entryTimestamp: Date.now(),
-            buyTxHash: result.txHash ?? "",
-            dexScreenerUrl: focused.dexScreenerUrl ?? "",
-          };
-
-          addPosition(newPosition);
-
-          if (result.txHash) {
-            await notifyBuy(focused.symbol, buyAmount, currentPrice, result.txHash);
-          } else if (config.dryRun) {
-            await notifyReentry(focused.symbol, buyAmount, currentPrice);
-          }
-
-          if (isAIEnabled()) {
-            const explanation = await explainTrade("buy", focused.symbol, {
-              price: currentPrice,
-              stopLoss: `${focused.stopLossPercent}%`,
-              takeProfit: `${focused.takeProfitPercent}%`,
-              usdcInvested: buyAmount,
-            });
-            if (explanation) await notify(`🤖 <i>${explanation}</i>`, "HTML");
-          }
-
-          logger.info({ symbol: focused.symbol, txHash: result.txHash }, "Focused buy successful");
-        } else {
-          logger.error({ error: result.error }, "Focused buy failed");
-          await notifyError(`Buy ${focused.symbol}`, result.error ?? "Unknown error");
-        }
-      } catch (buyErr) {
-        logger.error({ err: buyErr }, "Buy threw exception");
-        await notifyError(`Buy ${focused.symbol}`, String(buyErr));
-      }
-    } else {
-      // ── Position open — check SL/TP ────────────────────────────
-      position.currentPrice = currentPrice;
-      if (currentPrice > position.highestPrice) {
-        position.highestPrice = currentPrice;
-      }
-
-      const outcome = checkTpSl(
-        position,
-        focused.stopLossPercent,
-        focused.takeProfitPercent,
-        currentPrice
-      );
-
-      const slPrice = (position.entryPrice * (1 - focused.stopLossPercent / 100)).toPrecision(6);
-      const tpPrice = (position.entryPrice * (1 + focused.takeProfitPercent / 100)).toPrecision(6);
-
-      logger.debug(
-        { symbol: focused.symbol, price: currentPrice, sl: slPrice, tp: tpPrice, outcome },
-        "SL/TP check"
-      );
-
-      if (outcome === "hold") return;
-
-      // SL or TP triggered ─ sell
-      const profitPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
-      const triggerLabel = outcome === "take-profit" ? "TAKE PROFIT" : "STOP LOSS";
-
-      logger.info(
-        { symbol: focused.symbol, outcome, profit: profitPercent.toFixed(2) },
-        `${triggerLabel} TRIGGERED`
-      );
-
-      const sellResult = config.dryRun
-        ? { position, result: { success: true, buyAmount: position.usdcInvested } as SwapResult }
-        : await forceSell(focused.address, outcome);
-
-      if (sellResult?.result.success) {
-        if (outcome === "take-profit") {
-          await notifyTakeProfit(
-            focused.symbol,
-            profitPercent,
-            sellResult.result.txHash ?? "",
-            currentPrice
-          );
-        } else {
-          await notifyStopLoss(focused.symbol, focused.stopLossPercent, profitPercent, true);
-        }
-
-        if (sellResult.result.txHash) {
-          await notifySell(
-            focused.symbol,
-            sellResult.result.buyAmount ?? "0",
-            currentPrice,
-            profitPercent,
-            outcome,
-            sellResult.result.txHash
-          );
-        }
-
-        reentryCooldownUntil = Date.now() + config.reentryCooldownSec * 1000;
-        logger.info({ cooldownSec: config.reentryCooldownSec }, "Re-entry cooldown started");
-      } else {
-        logger.error(
-          { error: sellResult?.result.error },
-          `${triggerLabel} sell FAILED — will retry next tick`
-        );
+        await processMonitor(monitor);
+      } catch (err) {
+        logger.error({ err, symbol: monitor.symbol }, "Error processing monitor");
       }
     }
   } catch (err) {
     logger.error({ err }, "Tick error");
   } finally {
     isTicking = false;
+  }
+}
+
+/**
+ * Process a single monitored token:
+ *  - Fetch price
+ *  - Check stop-loss
+ *  - Check 25% milestones
+ */
+async function processMonitor(monitor: MonitoredToken): Promise<void> {
+  const currentPrice = await getTokenPrice(monitor.address as Address);
+  if (currentPrice === null) {
+    logger.warn({ token: monitor.address, symbol: monitor.symbol }, "Could not fetch price — skipping");
+    return;
+  }
+
+  logger.debug(
+    {
+      symbol: monitor.symbol,
+      currentPrice,
+      stopLoss: monitor.stopLossPrice,
+      entryPrice: monitor.entryPrice,
+      lastMilestone: monitor.lastNotifiedMilestone,
+    },
+    "Price check"
+  );
+
+  // ── Stop-loss check ────────────────────────────────────────────
+  if (currentPrice <= monitor.stopLossPrice) {
+    logger.info(
+      { symbol: monitor.symbol, currentPrice, stopLoss: monitor.stopLossPrice },
+      "STOP-LOSS TRIGGERED — selling all holdings"
+    );
+
+    const result = await forceSellByAddress(monitor.address, monitor.symbol, "stop-loss");
+
+    if (result.success) {
+      const lossPercent = ((currentPrice - monitor.entryPrice) / monitor.entryPrice) * 100;
+      await notifyStopLossHit(
+        monitor.symbol,
+        currentPrice,
+        monitor.stopLossPrice,
+        lossPercent,
+        result.txHash ?? "",
+        true
+      );
+      // Deactivate and remove the monitor
+      removeMonitor(monitor.address);
+      logger.info({ symbol: monitor.symbol }, "Monitor removed after stop-loss sell");
+    } else {
+      await notifyStopLossHit(
+        monitor.symbol,
+        currentPrice,
+        monitor.stopLossPrice,
+        0,
+        "",
+        false
+      );
+      logger.error(
+        { symbol: monitor.symbol, error: result.error },
+        "Stop-loss sell FAILED — will retry next tick"
+      );
+    }
+
+    return;
+  }
+
+  // ── 25% milestone check ────────────────────────────────────────
+  if (monitor.entryPrice > 0) {
+    const gainPercent = ((currentPrice - monitor.entryPrice) / monitor.entryPrice) * 100;
+    // Calculate which 25% milestone we're at (25, 50, 75, 100, 125, etc.)
+    const currentMilestone = Math.floor(gainPercent / 25) * 25;
+
+    if (currentMilestone > 0 && currentMilestone > monitor.lastNotifiedMilestone) {
+      // Notify for this milestone
+      await notifyMilestone(
+        monitor.symbol,
+        currentPrice,
+        monitor.entryPrice,
+        currentMilestone
+      );
+      updateMonitor(monitor.address, { lastNotifiedMilestone: currentMilestone });
+      logger.info(
+        { symbol: monitor.symbol, milestone: currentMilestone, price: currentPrice },
+        "Price milestone reached"
+      );
+    }
   }
 }
 
@@ -245,7 +163,6 @@ async function checkEthBalance(): Promise<void> {
 
     if (ethBalance < config.ethWarnThreshold) {
       const now = Date.now();
-      // Only warn once per hour
       if (now - lastEthWarning > 60 * 60 * 1000) {
         lastEthWarning = now;
         logger.warn({ balance: ethFormatted }, "Low ETH balance!");
@@ -257,47 +174,19 @@ async function checkEthBalance(): Promise<void> {
   }
 }
 
-// ── AI portfolio review ────────────────────────────────────────────
-
-async function doPortfolioReview(): Promise<void> {
-  try {
-    const positions = getPositions();
-    if (positions.length === 0) return;
-
-    const ethBal = await getEthBalanceFormatted();
-    const usdcBal = await getUsdcBalanceFormatted();
-    const advice = await reviewPortfolio(positions, parseFloat(usdcBal), ethBal);
-    if (!advice) return;
-
-    logger.info({ sentiment: advice.overallSentiment, summary: advice.summary }, "AI portfolio review");
-
-    for (const posAdvice of (advice.positionAdvice ?? [])) {
-      if (posAdvice.action === "sell") {
-        logger.info({ symbol: posAdvice.symbol, reason: posAdvice.reasoning }, "AI recommends selling");
-        const pos = positions.find((p) => p.tokenSymbol === posAdvice.symbol);
-        if (pos) {
-          await notify(`🤖 <b>AI SELL: ${posAdvice.symbol}</b>\nReason: ${posAdvice.reasoning}`, "HTML");
-          await forceSell(pos.tokenAddress, "ai-sell");
-        }
-      }
-    }
-  } catch (err) {
-    logger.error({ err }, "AI portfolio review failed");
-  }
-}
-
 // ── Scheduler ──────────────────────────────────────────────────────
 
 /**
- * Start the focused-token trading loop (10 s ticks).
- * Runs an immediate tick, then polls every 10 seconds.
+ * Start the price monitoring loop (30s ticks by default).
  */
-export function startFocusedTradingLoop(): void {
-  if (tickInterval) return; // already running
+export function startMonitorLoop(): void {
+  if (tickInterval) return;
+
+  const intervalMs = config.monitorIntervalSec * 1000;
 
   logger.info(
-    { tickMs: TICK_INTERVAL_MS, stopLoss: config.stopLossPercent, takeProfit: config.takeProfitPercent },
-    "Starting focused trading loop"
+    { intervalSec: config.monitorIntervalSec },
+    "Starting price monitor loop"
   );
 
   // Fire immediately, then on interval
@@ -305,16 +194,16 @@ export function startFocusedTradingLoop(): void {
 
   tickInterval = setInterval(() => {
     tick().catch((err) => logger.error({ err }, "Tick error"));
-  }, TICK_INTERVAL_MS);
+  }, intervalMs);
 }
 
 /**
- * Stop the focused-token trading loop gracefully.
+ * Stop the monitoring loop gracefully.
  */
-export function stopFocusedTradingLoop(): void {
+export function stopMonitorLoop(): void {
   if (tickInterval) {
     clearInterval(tickInterval);
     tickInterval = null;
-    logger.info("Focused trading loop stopped");
+    logger.info("Monitor loop stopped");
   }
 }

@@ -27,28 +27,16 @@ interface AppConfig {
   baseRpcUrl: string;
   /** ETH balance below which a warning is sent (in wei) */
   ethWarnThreshold: bigint;
-  /** Maximum concurrent token positions */
+  /** Maximum concurrent token monitors */
   maxPositions: number;
-  /** Percentage of USDC balance to invest per trade */
-  tradePercent: number;
-  /** Minimum USDC to keep in wallet (won't trade below this) */
-  minUsdcBalance: number;
   /** Slippage tolerance in basis points (100 = 1%) */
   slippageBps: number;
   /** If true, log trades but don't execute them */
   dryRun: boolean;
-  /** Anthropic API key for Claude-powered analysis */
-  anthropicApiKey: string;
   /** HTTP API port for the public dashboard */
   apiPort: number;
-  /** Flat stop-loss % below entry price (default 5) */
-  stopLossPercent: number;
-  /** Take-profit % above entry price (default 20) */
-  takeProfitPercent: number;
-  /** Seconds to wait before re-entering after SL/TP trigger */
-  reentryCooldownSec: number;
-  /** Pre-seed focused token on startup (optional) */
-  focusedToken: string;
+  /** Price monitor interval in seconds (default 30) */
+  monitorIntervalSec: number;
 }
 
 export const config: AppConfig = {
@@ -58,17 +46,11 @@ export const config: AppConfig = {
   zeroXApiKey: "",
   baseRpcUrl: "",
   ethWarnThreshold: 0n,
-  maxPositions: 5,
-  tradePercent: 10,
-  minUsdcBalance: 10,
+  maxPositions: 10,
   slippageBps: 100,
   dryRun: false,
-  anthropicApiKey: "",
   apiPort: 3000,
-  stopLossPercent: 5,
-  takeProfitPercent: 20,
-  reentryCooldownSec: 30,
-  focusedToken: "",
+  monitorIntervalSec: 30,
 };
 
 export function loadConfig(): void {
@@ -81,17 +63,11 @@ export function loadConfig(): void {
 
   config.baseRpcUrl = optionalEnv("BASE_RPC_URL", "https://mainnet.base.org");
   config.ethWarnThreshold = parseEther(optionalEnv("ETH_WARN_THRESHOLD", "0.001"));
-  config.maxPositions = parseInt(optionalEnv("MAX_POSITIONS", "5"), 10);
-  config.tradePercent = parseInt(optionalEnv("TRADE_PERCENT", "10"), 10);
-  config.minUsdcBalance = parseFloat(optionalEnv("MIN_USDC_BALANCE", "10"));
+  config.maxPositions = parseInt(optionalEnv("MAX_POSITIONS", "10"), 10);
   config.slippageBps = parseInt(optionalEnv("SLIPPAGE_BPS", "100"), 10);
   config.dryRun = optionalEnv("DRY_RUN", "false").toLowerCase() === "true";
-  config.anthropicApiKey = optionalEnv("ANTHROPIC_API_KEY", "");
   config.apiPort = parseInt(optionalEnv("PORT", "3000"), 10);
-  config.stopLossPercent = parseFloat(optionalEnv("STOP_LOSS_PERCENT", "5"));
-  config.takeProfitPercent = parseFloat(optionalEnv("TAKE_PROFIT_PERCENT", "20"));
-  config.reentryCooldownSec = parseInt(optionalEnv("REENTRY_COOLDOWN_SEC", "30"), 10);
-  config.focusedToken = optionalEnv("FOCUSED_TOKEN", "");
+  config.monitorIntervalSec = parseInt(optionalEnv("MONITOR_INTERVAL_SEC", "30"), 10);
 }
 
 // ── Base chain constants ───────────────────────────────────────────
@@ -150,9 +126,4 @@ export const ERC20_ABI = [
   },
 ] as const;
 
-/** Trailing stop-loss tier configuration */
-export const STOP_LOSS_TIERS = [
-  { minProfitPercent: 100, trailPercent: 5 },   // >100% profit → 5% trail
-  { minProfitPercent: 50, trailPercent: 10 },    // 50-100% profit → 10% trail
-  { minProfitPercent: 0, trailPercent: 20 },     // 0-50% profit → 20% trail
-] as const;
+

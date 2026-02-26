@@ -2,8 +2,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUnits, type Address } from "viem";
-import { STOP_LOSS_TIERS, config, USDC_DECIMALS } from "../config/index.js";
-import { getTokenPrices, getTokenPrice } from "../scanner/dexscreener.js";
+import { config, USDC_DECIMALS } from "../config/index.js";
+import { getTokenPrice } from "../scanner/dexscreener.js";
 import { sellAllToken, type SwapResult } from "../swap/executor.js";
 import { logger } from "../utils/logger.js";
 
@@ -23,21 +23,25 @@ export interface Position {
   dexScreenerUrl: string;
 }
 
-export interface FocusedTokenConfig {
-  /** Contract address of the token being actively traded */
+export interface MonitoredToken {
+  /** Contract address of the token being monitored */
   address: string;
   /** Token symbol (e.g. "DOGE") */
   symbol: string;
   /** Full token name */
   name: string;
-  /** % below entry price to trigger stop-loss sell */
-  stopLossPercent: number;
-  /** % above entry price to trigger take-profit sell */
-  takeProfitPercent: number;
-  /** Whether this focused-token loop is currently active */
+  /** Absolute stop-loss price — sell when price drops to or below this */
+  stopLossPrice: number;
+  /** Price when monitoring was started (for 25% milestone notifications) */
+  entryPrice: number;
+  /** Last notified 25% milestone (e.g. 0, 25, 50, 75, 100...) */
+  lastNotifiedMilestone: number;
+  /** Whether this monitor is currently active */
   active: boolean;
-  /** DexScreener pair URL for notifications */
+  /** DexScreener pair URL */
   dexScreenerUrl?: string;
+  /** Timestamp when monitoring started */
+  addedAt: number;
 }
 
 export interface TradeHistoryEntry {
@@ -60,7 +64,7 @@ const DATA_DIR = join(__dirname, "..", "data");
 const POSITIONS_FILE = join(DATA_DIR, "positions.json");
 const BLACKLIST_FILE = join(DATA_DIR, "blacklist.json");
 const HISTORY_FILE = join(DATA_DIR, "history.json");
-const FOCUSED_FILE = join(DATA_DIR, "focused.json");
+const MONITORS_FILE = join(DATA_DIR, "monitors.json");
 
 // ── State ──────────────────────────────────────────────────────────
 
@@ -68,7 +72,7 @@ let positions: Position[] = [];
 let blacklist: Set<string> = new Set();
 let history: TradeHistoryEntry[] = [];
 let tradingPaused = false;
-let focusedToken: FocusedTokenConfig | null = null;
+let monitors: MonitoredToken[] = [];
 
 // ── Persistence ────────────────────────────────────────────────────
 
@@ -103,10 +107,10 @@ export function initPositionManager(): void {
   const blacklistArr = loadJson<string[]>(BLACKLIST_FILE, []);
   blacklist = new Set(blacklistArr.map((a) => a.toLowerCase()));
   history = loadJson<TradeHistoryEntry[]>(HISTORY_FILE, []);
-  focusedToken = loadJson<FocusedTokenConfig | null>(FOCUSED_FILE, null);
+  monitors = loadJson<MonitoredToken[]>(MONITORS_FILE, []);
 
   logger.info(
-    { positions: positions.length, blacklist: blacklist.size, history: history.length, focusedToken: focusedToken?.symbol ?? "none" },
+    { positions: positions.length, blacklist: blacklist.size, history: history.length, monitors: monitors.length },
     "Position manager initialized"
   );
 }
@@ -146,22 +150,60 @@ export function setPaused(paused: boolean): void {
   logger.info({ paused }, "Trading paused state changed");
 }
 
-// ── Focused token management ─────────────────────────────────────────────────
+// ── Monitor management ─────────────────────────────────────────────
 
-export function getFocusedToken(): FocusedTokenConfig | null {
-  return focusedToken;
+export function getMonitors(): MonitoredToken[] {
+  return [...monitors];
 }
 
-export function setFocusedToken(cfg: FocusedTokenConfig): void {
-  focusedToken = cfg;
-  saveJson(FOCUSED_FILE, focusedToken);
-  logger.info({ symbol: cfg.symbol, address: cfg.address, sl: cfg.stopLossPercent, tp: cfg.takeProfitPercent }, "Focused token set");
+export function getActiveMonitors(): MonitoredToken[] {
+  return monitors.filter((m) => m.active);
 }
 
-export function clearFocusedToken(): void {
-  focusedToken = null;
-  saveJson(FOCUSED_FILE, null);
-  logger.info("Focused token cleared");
+export function getMonitor(address: string): MonitoredToken | undefined {
+  return monitors.find(
+    (m) => m.address.toLowerCase() === address.toLowerCase()
+  );
+}
+
+export function addMonitor(monitor: MonitoredToken): void {
+  // Remove existing monitor for same token if any
+  monitors = monitors.filter(
+    (m) => m.address.toLowerCase() !== monitor.address.toLowerCase()
+  );
+  monitors.push(monitor);
+  saveJson(MONITORS_FILE, monitors);
+  logger.info(
+    { symbol: monitor.symbol, address: monitor.address, stopLoss: monitor.stopLossPrice },
+    "Monitor added"
+  );
+}
+
+export function removeMonitor(address: string): MonitoredToken | undefined {
+  const idx = monitors.findIndex(
+    (m) => m.address.toLowerCase() === address.toLowerCase()
+  );
+  if (idx === -1) return undefined;
+  const [removed] = monitors.splice(idx, 1);
+  saveJson(MONITORS_FILE, monitors);
+  logger.info({ symbol: removed.symbol }, "Monitor removed");
+  return removed;
+}
+
+export function updateMonitor(address: string, updates: Partial<MonitoredToken>): void {
+  const monitor = monitors.find(
+    (m) => m.address.toLowerCase() === address.toLowerCase()
+  );
+  if (monitor) {
+    Object.assign(monitor, updates);
+    saveJson(MONITORS_FILE, monitors);
+  }
+}
+
+export function clearAllMonitors(): void {
+  monitors = [];
+  saveJson(MONITORS_FILE, monitors);
+  logger.info("All monitors cleared");
 }
 
 // ── Position management ────────────────────────────────────────────
@@ -173,7 +215,6 @@ export function addPosition(pos: Position): void {
   positions.push(pos);
   saveJson(POSITIONS_FILE, positions);
 
-  // Record in history
   addHistoryEntry({
     type: "buy",
     tokenAddress: pos.tokenAddress,
@@ -231,168 +272,12 @@ export function removeFromBlacklist(tokenAddress: string): void {
 
 // ── History ────────────────────────────────────────────────────────
 
-function addHistoryEntry(entry: TradeHistoryEntry): void {
+export function addHistoryEntry(entry: TradeHistoryEntry): void {
   history.push(entry);
-  // Keep last 100 entries
   if (history.length > 100) {
     history = history.slice(-100);
   }
   saveJson(HISTORY_FILE, history);
-}
-
-// ── SL/TP engine ──────────────────────────────────────────────────
-
-/**
- * Check whether the current price has crossed the flat SL or TP threshold.
- * TP is checked first (profit wins over loss).
- */
-export function checkTpSl(
-  position: Position,
-  stopLossPercent: number,
-  takeProfitPercent: number,
-  currentPrice: number
-): "hold" | "stop-loss" | "take-profit" {
-  const slPrice = position.entryPrice * (1 - stopLossPercent / 100);
-  const tpPrice = position.entryPrice * (1 + takeProfitPercent / 100);
-
-  if (currentPrice >= tpPrice) return "take-profit";
-  if (currentPrice <= slPrice) return "stop-loss";
-  return "hold";
-}
-
-// ── Stop-loss engine (legacy trailing — used for /portfolio display) ─
-
-/**
- * Compute the trailing stop-loss price for a position.
- * Uses tiered trailing: tighter trail at higher profits.
- */
-export function computeStopPrice(position: Position): {
-  stopPrice: number;
-  trailPercent: number;
-  profitPercent: number;
-} {
-  const profitPercent =
-    ((position.highestPrice - position.entryPrice) / position.entryPrice) * 100;
-
-  // Find the applicable tier
-  let trailPercent = 20; // default
-  for (const tier of STOP_LOSS_TIERS) {
-    if (profitPercent >= tier.minProfitPercent) {
-      trailPercent = tier.trailPercent;
-      break; // Tiers are sorted descending by minProfitPercent
-    }
-  }
-
-  const stopPrice = position.highestPrice * (1 - trailPercent / 100);
-
-  return { stopPrice, trailPercent, profitPercent };
-}
-
-/**
- * Check all positions against current prices and trigger stop-loss sells.
- * Returns array of positions that were sold.
- */
-export async function evaluateStopLosses(): Promise<
-  Array<{ position: Position; result: SwapResult; reason: string }>
-> {
-  if (positions.length === 0) return [];
-
-  const tokenAddresses = positions.map((p) => p.tokenAddress as Address);
-  const prices = await getTokenPrices(tokenAddresses);
-
-  const sold: Array<{ position: Position; result: SwapResult; reason: string }> = [];
-
-  // Iterate over a copy since we may modify positions
-  for (const pos of [...positions]) {
-    const addr = pos.tokenAddress.toLowerCase();
-    const currentPrice = prices.get(addr);
-
-    if (currentPrice == null) {
-      logger.warn({ symbol: pos.tokenSymbol }, "Could not fetch price, skipping");
-      continue;
-    }
-
-    // Update current price
-    pos.currentPrice = currentPrice;
-
-    // Update highest price
-    if (currentPrice > pos.highestPrice) {
-      pos.highestPrice = currentPrice;
-    }
-
-    // Compute stop price
-    const { stopPrice, trailPercent, profitPercent } = computeStopPrice(pos);
-
-    logger.debug(
-      {
-        symbol: pos.tokenSymbol,
-        currentPrice,
-        highestPrice: pos.highestPrice,
-        stopPrice,
-        trailPercent,
-        profitPercent: profitPercent.toFixed(2),
-      },
-      "Stop-loss check"
-    );
-
-    // Check if price has fallen below stop
-    if (currentPrice <= stopPrice) {
-      const reason = `Tiered trailing stop-loss triggered (${trailPercent}% trail, profit was ${profitPercent.toFixed(1)}%)`;
-      logger.info(
-        { symbol: pos.tokenSymbol, currentPrice, stopPrice, trailPercent },
-        "STOP-LOSS TRIGGERED — selling position"
-      );
-
-      if (config.dryRun) {
-        logger.info({ symbol: pos.tokenSymbol }, "DRY RUN — would sell here");
-        sold.push({
-          position: pos,
-          result: { success: true },
-          reason,
-        });
-        continue;
-      }
-
-      // Execute sell
-      const result = await sellAllToken(pos.tokenAddress as Address);
-
-      if (result.success) {
-        const sellProfitPercent =
-          ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-
-        // buyAmount from 0x API is raw USDC (6 decimals) — format to human-readable
-        const usdcReceived = result.buyAmount
-          ? formatUnits(BigInt(result.buyAmount), USDC_DECIMALS)
-          : "0";
-
-        addHistoryEntry({
-          type: "sell",
-          tokenAddress: pos.tokenAddress,
-          tokenSymbol: pos.tokenSymbol,
-          price: currentPrice,
-          amount: pos.quantity,
-          usdcAmount: usdcReceived,
-          txHash: result.txHash ?? "",
-          timestamp: Date.now(),
-          reason: "stop-loss",
-          profitPercent: sellProfitPercent,
-        });
-
-        removePosition(pos.tokenAddress);
-        sold.push({ position: pos, result, reason });
-      } else {
-        logger.error(
-          { symbol: pos.tokenSymbol, error: result.error },
-          "Stop-loss sell FAILED — will retry next cycle"
-        );
-      }
-    }
-  }
-
-  // Save updated prices and highest prices
-  saveJson(POSITIONS_FILE, positions);
-
-  return sold;
 }
 
 /**
@@ -421,7 +306,6 @@ export async function forceSell(
       ? ((price - pos.entryPrice) / pos.entryPrice) * 100
       : 0;
 
-    // buyAmount from 0x API is raw USDC (6 decimals) — format to human-readable
     const usdcReceived = result.buyAmount
       ? formatUnits(BigInt(result.buyAmount), USDC_DECIMALS)
       : "0";
@@ -446,12 +330,50 @@ export async function forceSell(
 }
 
 /**
+ * Force-sell a token by address (for monitored tokens without Position entry).
+ * Uses sellAllToken directly.
+ */
+export async function forceSellByAddress(
+  tokenAddress: string,
+  symbol: string,
+  reason: string = "stop-loss"
+): Promise<SwapResult> {
+  if (config.dryRun) {
+    logger.info({ symbol }, "DRY RUN — would sell all " + symbol);
+    return { success: true };
+  }
+
+  const result = await sellAllToken(tokenAddress as Address);
+  const price = await getTokenPrice(tokenAddress as Address);
+
+  if (result.success) {
+    const usdcReceived = result.buyAmount
+      ? formatUnits(BigInt(result.buyAmount), USDC_DECIMALS)
+      : "0";
+
+    addHistoryEntry({
+      type: "sell",
+      tokenAddress,
+      tokenSymbol: symbol,
+      price: price ?? 0,
+      amount: "all",
+      usdcAmount: usdcReceived,
+      txHash: result.txHash ?? "",
+      timestamp: Date.now(),
+      reason,
+    });
+  }
+
+  return result;
+}
+
+/**
  * Save current state to disk (call on shutdown).
  */
 export function saveAllState(): void {
   saveJson(POSITIONS_FILE, positions);
   saveJson(BLACKLIST_FILE, [...blacklist]);
   saveJson(HISTORY_FILE, history);
-  if (focusedToken !== null) saveJson(FOCUSED_FILE, focusedToken);
+  saveJson(MONITORS_FILE, monitors);
   logger.info("All state persisted to disk");
 }
