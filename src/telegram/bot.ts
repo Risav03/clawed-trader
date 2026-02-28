@@ -627,7 +627,6 @@ async function handleSimple(ctx: Context): Promise<void> {
   addMonitor(monitor);
 
   const slPercent = ((info.priceUsd - stopLoss) / info.priceUsd * 100).toFixed(1);
-  const hasPosition = !!getPosition(contractAddress);
 
   await ctx.reply(
     `✅ <b>Simple monitor: ${escapeHtml(info.symbol)}</b>\n\n` +
@@ -636,7 +635,7 @@ async function handleSimple(ctx: Context): Promise<void> {
       `🛑 Stop-loss: $${stopLoss} (${slPercent}% below)\n` +
       `📊 Notify: every +${notifyPercent}% gain\n` +
       `⏱️ Checking every ${config.monitorIntervalSec}s\n` +
-      `${hasPosition ? "🔴 Will auto-sell on stop-loss (position found)" : "📢 Notify-only on stop-loss (no position held)"}\n\n` +
+      `🔴 Will auto-sell on stop-loss (sells from wallet balance)\n\n` +
       `${config.dryRun ? "🔧 <b>DRY RUN MODE</b>" : "🔴 <b>LIVE MODE</b>"}`,
     { parse_mode: "HTML" }
   );

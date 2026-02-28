@@ -10,6 +10,7 @@ import {
   getPosition,
   updateMonitor,
   removeMonitor,
+  removePosition,
   forceSellByAddress,
   type MonitoredToken,
 } from "../positions/manager.js";
@@ -184,42 +185,63 @@ async function processSimple(monitor: MonitoredToken, currentPrice: number): Pro
 
   // ── Stop-loss check ────────────────────────────────────────────
   if (monitor.stopLossPrice > 0 && currentPrice <= monitor.stopLossPrice) {
-    const position = getPosition(monitor.address);
+    logger.info(
+      { symbol: monitor.symbol, currentPrice, stopLoss: monitor.stopLossPrice },
+      "SIMPLE STOP-LOSS TRIGGERED — attempting sell"
+    );
 
-    if (position) {
-      // Position exists — auto-sell
-      logger.info(
-        { symbol: monitor.symbol, currentPrice, stopLoss: monitor.stopLossPrice },
-        "SIMPLE STOP-LOSS — selling position"
-      );
+    // Always attempt to sell from wallet (forceSellByAddress checks actual wallet balance)
+    const result = await forceSellByAddress(monitor.address, monitor.symbol, "stop-loss");
+    const lossPercent = ((currentPrice - monitor.entryPrice) / monitor.entryPrice) * 100;
 
-      const result = await forceSellByAddress(monitor.address, monitor.symbol, "stop-loss");
-      const lossPercent = ((currentPrice - monitor.entryPrice) / monitor.entryPrice) * 100;
-
+    if (result.success) {
       await notifyStopLossHit(
         monitor.symbol,
         currentPrice,
         monitor.stopLossPrice,
         lossPercent,
         result.txHash ?? "",
-        result.success
-      );
-    } else {
-      // No position — notify only
-      logger.info(
-        { symbol: monitor.symbol, currentPrice, stopLoss: monitor.stopLossPrice },
-        "SIMPLE STOP-LOSS — notify only (no position)"
+        true
       );
 
-      const lossPercent = ((currentPrice - monitor.entryPrice) / monitor.entryPrice) * 100;
-      await notify(
-        `🛑 <b>STOP-LOSS HIT: ${monitor.symbol}</b>\n\n` +
-          `💵 Price: $${currentPrice.toPrecision(6)}\n` +
-          `🎯 Stop-loss was: $${monitor.stopLossPrice}\n` +
-          `📉 Change from entry: ${lossPercent >= 0 ? "+" : ""}${lossPercent.toFixed(1)}%\n` +
-          `ℹ️ No position held — notification only`,
-        "HTML"
-      );
+      // Also remove tracked position if one exists
+      const position = getPosition(monitor.address);
+      if (position) {
+        removePosition(monitor.address);
+      }
+    } else {
+      // Sell failed (possibly zero balance — wallet doesn't hold the token)
+      const isZeroBalance = result.error?.includes("Zero token balance");
+
+      if (isZeroBalance) {
+        logger.info(
+          { symbol: monitor.symbol },
+          "SIMPLE STOP-LOSS — no tokens in wallet, notify only"
+        );
+        await notify(
+          `🛑 <b>STOP-LOSS HIT: ${monitor.symbol}</b>\n\n` +
+            `💵 Price: $${currentPrice.toPrecision(6)}\n` +
+            `🎯 Stop-loss was: $${monitor.stopLossPrice}\n` +
+            `📉 Change from entry: ${lossPercent >= 0 ? "+" : ""}${lossPercent.toFixed(1)}%\n` +
+            `ℹ️ No tokens in wallet — notification only`,
+          "HTML"
+        );
+      } else {
+        // Actual sell failure — notify and retry next tick
+        await notifyStopLossHit(
+          monitor.symbol,
+          currentPrice,
+          monitor.stopLossPrice,
+          lossPercent,
+          "",
+          false
+        );
+        logger.error(
+          { symbol: monitor.symbol, error: result.error },
+          "Stop-loss sell FAILED — will retry next tick"
+        );
+        return; // Don't remove monitor — retry next tick
+      }
     }
 
     removeMonitor(monitor.address);
