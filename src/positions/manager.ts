@@ -23,7 +23,11 @@ export interface Position {
   dexScreenerUrl: string;
 }
 
+export type MonitorType = "standard" | "simple" | "buyback";
+
 export interface MonitoredToken {
+  /** Monitor type — determines tick behavior (defaults to 'standard' for backward compat) */
+  type?: MonitorType;
   /** Contract address of the token being monitored */
   address: string;
   /** Token symbol (e.g. "DOGE") */
@@ -32,9 +36,9 @@ export interface MonitoredToken {
   name: string;
   /** Absolute stop-loss price — sell when price drops to or below this */
   stopLossPrice: number;
-  /** Price when monitoring was started (for 25% milestone notifications) */
+  /** Price when monitoring was started (for milestone notifications) */
   entryPrice: number;
-  /** Last notified 25% milestone (e.g. 0, 25, 50, 75, 100...) */
+  /** Last notified milestone (e.g. 0, 25, 50, 75, 100...) */
   lastNotifiedMilestone: number;
   /** Whether this monitor is currently active */
   active: boolean;
@@ -42,6 +46,22 @@ export interface MonitoredToken {
   dexScreenerUrl?: string;
   /** Timestamp when monitoring started */
   addedAt: number;
+
+  // ── Simple / Buyback fields ────────────────────────────────────
+  /** Custom notification percent interval (used by simple & buyback) */
+  notifyPercent?: number;
+
+  // ── Buyback-only fields ────────────────────────────────────────
+  /** USDC to spend per buyback event */
+  usdcPerBuyback?: number;
+  /** Cumulative % drop interval that triggers a buyback */
+  buybackPercent?: number;
+  /** Total USDC budget for buybacks */
+  totalUsdcBudget?: number;
+  /** USDC already spent on buybacks */
+  usdcSpent?: number;
+  /** Last cumulative drop level that triggered a buyback (1 = first interval, 2 = second, etc.) */
+  lastBuybackLevel?: number;
 }
 
 export interface TradeHistoryEntry {

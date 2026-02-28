@@ -3,11 +3,13 @@ import { formatUnits, type Address } from "viem";
 import { config, USDC_DECIMALS } from "../config/index.js";
 import {
   getEthBalanceFormatted,
+  getUsdcBalance,
   getUsdcBalanceFormatted,
   getWalletAddress,
 } from "../chain/wallet.js";
 import {
   getPositions,
+  getPosition,
   getHistory,
   isTradingPaused,
   setPaused,
@@ -20,8 +22,10 @@ import {
   removeMonitor,
   clearAllMonitors,
   type MonitoredToken,
+  type MonitorType,
   type TradeHistoryEntry,
 } from "../positions/manager.js";
+import { buyToken } from "../swap/executor.js";
 import { getTokenInfo } from "../scanner/dexscreener.js";
 import { logger } from "../utils/logger.js";
 
@@ -63,12 +67,13 @@ export function createBot(): Bot {
         `<b>Example:</b>\n` +
         `<code>0x1234...abcd 0.005</code>\n\n` +
         `<b>Commands:</b>\n` +
+        `/simple &lt;address&gt; &lt;stop-loss&gt; &lt;notify%&gt; — Monitor with custom notify interval\n` +
+        `/buyback &lt;address&gt; &lt;notify%&gt; &lt;usdc&gt; &lt;buyback%&gt; — Monitor + auto buy on dips\n` +
         `/status — Overview (balances, monitors)\n` +
         `/monitors — List all active monitors\n` +
         `/balance — ETH + USDC balances\n` +
         `/history — Last 10 trades\n` +
-        `/stop &lt;address&gt; — Stop monitoring a token\n` +
-        `/stopall — Stop all monitors\n` +
+        `/stop — Stop all monitors (or /stop &lt;address&gt; for one)\n` +
         `/sell &lt;address&gt; — Force-sell a token\n` +
         `/pause — Pause all monitoring\n` +
         `/resume — Resume monitoring`,
@@ -85,6 +90,8 @@ export function createBot(): Bot {
   bot.command("sell", handleSell);
   bot.command("stop", handleStop);
   bot.command("stopall", handleStopAll);
+  bot.command("simple", handleSimple);
+  bot.command("buyback", handleBuyback);
 
   // ── Text message handler: parse "<address> <stop_loss_price>" ──
   bot.on("message:text", async (ctx) => {
@@ -215,7 +222,7 @@ export async function notifyStopLossHit(
   );
 }
 
-/** Notify about a 25% price milestone */
+/** Notify about a price milestone */
 export async function notifyMilestone(
   symbol: string,
   currentPrice: number,
@@ -228,6 +235,45 @@ export async function notifyMilestone(
       `💵 Current price: $${currentPrice.toPrecision(6)}\n` +
       `📈 Entry price: $${entryPrice.toPrecision(6)}\n` +
       `📊 Gain: +${gainPercent}%`,
+    "HTML"
+  );
+}
+
+/** Notify about a buyback execution */
+export async function notifyBuyback(
+  symbol: string,
+  currentPrice: number,
+  entryPrice: number,
+  dropPercent: number,
+  usdcSpent: number,
+  usdcRemaining: number,
+  txHash: string,
+  success: boolean
+): Promise<void> {
+  const basescanLink = txHash ? `\n🔗 <a href="https://basescan.org/tx/${txHash}">View on BaseScan</a>` : "";
+  const status = success ? "✅ Buy executed" : "❌ Buy FAILED";
+  await notify(
+    `🔄 <b>BUYBACK: ${symbol}</b>\n\n` +
+      `📉 Drop from entry: -${dropPercent.toFixed(1)}%\n` +
+      `💵 Current price: $${currentPrice.toPrecision(6)}\n` +
+      `📈 Entry price: $${entryPrice.toPrecision(6)}\n` +
+      `${status}\n` +
+      `💰 Spent this buy: $${usdcSpent.toFixed(2)}\n` +
+      `💼 Budget remaining: $${usdcRemaining.toFixed(2)}` +
+      basescanLink,
+    "HTML"
+  );
+}
+
+/** Notify that buyback budget is exhausted */
+export async function notifyBudgetExhausted(
+  symbol: string,
+  totalSpent: number
+): Promise<void> {
+  await notify(
+    `💸 <b>${symbol} BUYBACK BUDGET EXHAUSTED</b>\n\n` +
+      `Total spent: $${totalSpent.toFixed(2)} USDC\n` +
+      `No more buybacks will execute. Use /stop to remove this monitor.`,
     "HTML"
   );
 }
@@ -289,8 +335,17 @@ async function handleStatus(ctx: Context): Promise<void> {
     } else {
       monitorBlock = "📡 <b>Active Monitors:</b>\n" +
         monitors.map((m) => {
-          const slPercent = ((m.entryPrice - m.stopLossPrice) / m.entryPrice * 100).toFixed(1);
-          return `  • <b>${m.symbol}</b> — SL: $${m.stopLossPrice} (${slPercent}% below entry $${m.entryPrice.toPrecision(6)})`;
+          const monitorType = m.type ?? "standard";
+          const typeIcon = monitorType === "standard" ? "📋" : monitorType === "simple" ? "🔍" : "🔄";
+          if (monitorType === "buyback") {
+            const spent = m.usdcSpent ?? 0;
+            const budget = m.totalUsdcBudget ?? 0;
+            return `  ${typeIcon} <b>${m.symbol}</b> (buyback) — $${spent.toFixed(0)}/$${budget.toFixed(0)} spent`;
+          }
+          const slInfo = m.stopLossPrice > 0
+            ? `SL: $${m.stopLossPrice}`
+            : "no SL";
+          return `  ${typeIcon} <b>${m.symbol}</b> (${monitorType}) — ${slInfo}`;
         }).join("\n") + "\n";
     }
 
@@ -319,22 +374,37 @@ async function handleMonitors(ctx: Context): Promise<void> {
 
   let msg = "📡 <b>Active Monitors</b>\n\n";
   for (const m of monitors) {
-    const slPercent = m.entryPrice > 0
-      ? ((m.entryPrice - m.stopLossPrice) / m.entryPrice * 100).toFixed(1)
-      : "?";
-    const status = m.active ? "🟢 Active" : "❌ Inactive";
+    const monitorType = m.type ?? "standard";
+    const typeLabel = monitorType === "standard" ? "📋" : monitorType === "simple" ? "🔍" : "🔄";
+    const status = m.active ? "🟢" : "❌";
     const held = timeSince(m.addedAt);
 
-    msg +=
-      `<b>${m.symbol}</b> ${status}\n` +
-      `   📍 <code>${m.address}</code>\n` +
-      `   💵 Entry: $${m.entryPrice.toPrecision(6)}\n` +
-      `   🛑 SL: $${m.stopLossPrice} (${slPercent}% below)\n` +
-      `   📊 Last milestone: +${m.lastNotifiedMilestone}%\n` +
-      `   ⏱️ Monitoring for: ${held}\n\n`;
+    msg += `${typeLabel} <b>${m.symbol}</b> ${status} <i>(${monitorType})</i>\n`;
+    msg += `   📍 <code>${m.address}</code>\n`;
+    msg += `   💵 Entry: $${m.entryPrice.toPrecision(6)}\n`;
+
+    if (m.stopLossPrice > 0) {
+      const slPercent = m.entryPrice > 0
+        ? ((m.entryPrice - m.stopLossPrice) / m.entryPrice * 100).toFixed(1)
+        : "?";
+      msg += `   🛑 SL: $${m.stopLossPrice} (${slPercent}% below)\n`;
+    }
+
+    const notifyPct = m.notifyPercent ?? 25;
+    msg += `   📊 Notify: every +${notifyPct}% | Last: +${m.lastNotifiedMilestone}%\n`;
+
+    if (monitorType === "buyback") {
+      const spent = m.usdcSpent ?? 0;
+      const budget = m.totalUsdcBudget ?? 0;
+      const remaining = Math.max(0, budget - spent);
+      msg += `   📉 Buyback: $${m.usdcPerBuyback} every -${m.buybackPercent}%\n`;
+      msg += `   💰 Budget: $${spent.toFixed(2)} / $${budget.toFixed(2)} ($${remaining.toFixed(2)} left)\n`;
+    }
+
+    msg += `   ⏱️ Monitoring for: ${held}\n\n`;
   }
 
-  msg += `Use /stop &lt;address&gt; to remove a monitor.`;
+  msg += `Use /stop &lt;address&gt; to remove a monitor, or /stop to stop all.`;
   await ctx.reply(msg, { parse_mode: "HTML" });
 }
 
@@ -454,17 +524,15 @@ async function handleStop(ctx: Context): Promise<void> {
   const text = ctx.message?.text ?? "";
   const parts = text.split(/\s+/);
   if (parts.length < 2) {
+    // No address provided — stop ALL monitors
     const monitors = getActiveMonitors();
     if (monitors.length === 0) {
       await ctx.reply("📭 No active monitors to stop.");
       return;
     }
-    let msg = "Usage: /stop <token_address>\n\nActive monitors:\n";
-    for (const m of monitors) {
-      msg += `• ${m.symbol}: <code>${m.address}</code>\n`;
-    }
-    msg += "\nOr use /stopall to stop all monitors.";
-    await ctx.reply(msg, { parse_mode: "HTML" });
+    const count = monitors.length;
+    clearAllMonitors();
+    await ctx.reply(`⏹️ Stopped all <b>${count}</b> monitor(s).`, { parse_mode: "HTML" });
     return;
   }
 
@@ -486,6 +554,189 @@ async function handleStopAll(ctx: Context): Promise<void> {
   const count = monitors.length;
   clearAllMonitors();
   await ctx.reply(`⏹️ Stopped all <b>${count}</b> monitor(s).`, { parse_mode: "HTML" });
+}
+
+// ── /simple command handler ─────────────────────────────────────────
+
+async function handleSimple(ctx: Context): Promise<void> {
+  const text = ctx.message?.text ?? "";
+  const parts = text.split(/\s+/);
+
+  if (parts.length < 4) {
+    await ctx.reply(
+      `<b>Usage:</b>\n<code>/simple &lt;contract-address&gt; &lt;stop-loss&gt; &lt;notify-percent&gt;</code>\n\n` +
+        `<b>Example:</b>\n<code>/simple 0x1234...abcd 0.003 5</code>\n` +
+        `Monitors the token, notifies every +5% gain, auto-sells at $0.003 if you hold a position.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const contractAddress = parts[1].trim();
+  const stopLoss = parseFloat(parts[2]);
+  const notifyPercent = parseFloat(parts[3]);
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) {
+    await ctx.reply("❌ Invalid contract address. Must be a 0x... address (40 hex chars).");
+    return;
+  }
+  if (isNaN(stopLoss) || stopLoss <= 0) {
+    await ctx.reply("❌ Invalid stop-loss price. Must be a positive number.");
+    return;
+  }
+  if (isNaN(notifyPercent) || notifyPercent <= 0) {
+    await ctx.reply("❌ Invalid notify percent. Must be a positive number.");
+    return;
+  }
+
+  await ctx.reply("⏳ Looking up token...");
+  const info = await getTokenInfo(contractAddress);
+  if (!info) {
+    await ctx.reply(
+      `❌ Could not find token <code>${escapeHtml(contractAddress)}</code> on Base.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+  if (info.priceUsd <= 0) {
+    await ctx.reply(`❌ Could not get current price for <b>${escapeHtml(info.symbol)}</b>.`, { parse_mode: "HTML" });
+    return;
+  }
+  if (stopLoss >= info.priceUsd) {
+    await ctx.reply(
+      `⚠️ Stop-loss ($${stopLoss}) is at or above current price ($${info.priceUsd.toPrecision(6)}).\n` +
+        `Please set a stop-loss below current price.`
+    );
+    return;
+  }
+
+  const monitor: MonitoredToken = {
+    type: "simple",
+    address: info.address,
+    symbol: info.symbol,
+    name: info.name,
+    stopLossPrice: stopLoss,
+    entryPrice: info.priceUsd,
+    lastNotifiedMilestone: 0,
+    active: true,
+    dexScreenerUrl: info.dexScreenerUrl,
+    addedAt: Date.now(),
+    notifyPercent,
+  };
+
+  addMonitor(monitor);
+
+  const slPercent = ((info.priceUsd - stopLoss) / info.priceUsd * 100).toFixed(1);
+  const hasPosition = !!getPosition(contractAddress);
+
+  await ctx.reply(
+    `✅ <b>Simple monitor: ${escapeHtml(info.symbol)}</b>\n\n` +
+      `📍 Address: <code>${info.address}</code>\n` +
+      `💵 Current price: $${info.priceUsd.toPrecision(6)}\n` +
+      `🛑 Stop-loss: $${stopLoss} (${slPercent}% below)\n` +
+      `📊 Notify: every +${notifyPercent}% gain\n` +
+      `⏱️ Checking every ${config.monitorIntervalSec}s\n` +
+      `${hasPosition ? "🔴 Will auto-sell on stop-loss (position found)" : "📢 Notify-only on stop-loss (no position held)"}\n\n` +
+      `${config.dryRun ? "🔧 <b>DRY RUN MODE</b>" : "🔴 <b>LIVE MODE</b>"}`,
+    { parse_mode: "HTML" }
+  );
+}
+
+// ── /buyback command handler ────────────────────────────────────────
+
+async function handleBuyback(ctx: Context): Promise<void> {
+  const text = ctx.message?.text ?? "";
+  const parts = text.split(/\s+/);
+
+  if (parts.length < 5) {
+    await ctx.reply(
+      `<b>Usage:</b>\n<code>/buyback &lt;contract-address&gt; &lt;notify-percent&gt; &lt;usdc-amount&gt; &lt;buyback-percent&gt;</code>\n\n` +
+        `<b>Example:</b>\n<code>/buyback 0x1234...abcd 5 100 10</code>\n` +
+        `Notifies every +5% gain. Buys $100 USDC worth for every 10% dip from entry.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const contractAddress = parts[1].trim();
+  const notifyPercent = parseFloat(parts[2]);
+  const usdcAmount = parseFloat(parts[3]);
+  const buybackPercent = parseFloat(parts[4]);
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) {
+    await ctx.reply("❌ Invalid contract address. Must be a 0x... address (40 hex chars).");
+    return;
+  }
+  if (isNaN(notifyPercent) || notifyPercent <= 0) {
+    await ctx.reply("❌ Invalid notify percent. Must be a positive number.");
+    return;
+  }
+  if (isNaN(usdcAmount) || usdcAmount <= 0) {
+    await ctx.reply("❌ Invalid USDC amount. Must be a positive number.");
+    return;
+  }
+  if (isNaN(buybackPercent) || buybackPercent <= 0) {
+    await ctx.reply("❌ Invalid buyback percent. Must be a positive number.");
+    return;
+  }
+
+  await ctx.reply("⏳ Looking up token...");
+  const info = await getTokenInfo(contractAddress);
+  if (!info) {
+    await ctx.reply(
+      `❌ Could not find token <code>${escapeHtml(contractAddress)}</code> on Base.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+  if (info.priceUsd <= 0) {
+    await ctx.reply(`❌ Could not get current price for <b>${escapeHtml(info.symbol)}</b>.`, { parse_mode: "HTML" });
+    return;
+  }
+
+  // Check USDC balance
+  const usdcBal = await getUsdcBalanceFormatted();
+  const usdcBalNum = parseFloat(usdcBal);
+  let balanceWarning = "";
+  if (usdcBalNum < usdcAmount) {
+    balanceWarning = `\n⚠️ <b>Warning:</b> USDC balance ($${usdcBalNum.toFixed(2)}) is less than budget ($${usdcAmount})`;
+  }
+
+  const monitor: MonitoredToken = {
+    type: "buyback",
+    address: info.address,
+    symbol: info.symbol,
+    name: info.name,
+    stopLossPrice: 0,  // No stop-loss for buyback strategy
+    entryPrice: info.priceUsd,
+    lastNotifiedMilestone: 0,
+    active: true,
+    dexScreenerUrl: info.dexScreenerUrl,
+    addedAt: Date.now(),
+    notifyPercent,
+    usdcPerBuyback: usdcAmount,
+    buybackPercent,
+    totalUsdcBudget: usdcBalNum, // Use available USDC balance as budget cap
+    usdcSpent: 0,
+    lastBuybackLevel: 0,
+  };
+
+  addMonitor(monitor);
+
+  const buybackSlots = Math.floor(usdcBalNum / usdcAmount);
+
+  await ctx.reply(
+    `✅ <b>Buyback monitor: ${escapeHtml(info.symbol)}</b>\n\n` +
+      `📍 Address: <code>${info.address}</code>\n` +
+      `💵 Entry price: $${info.priceUsd.toPrecision(6)}\n` +
+      `📊 Notify: every +${notifyPercent}% gain\n` +
+      `📉 Buyback: $${usdcAmount} USDC every -${buybackPercent}% drop\n` +
+      `💰 Budget: $${usdcBalNum.toFixed(2)} USDC (~${buybackSlots} buyback${buybackSlots !== 1 ? "s" : ""})\n` +
+      `⏱️ Checking every ${config.monitorIntervalSec}s` +
+      balanceWarning +
+      `\n\n${config.dryRun ? "🔧 <b>DRY RUN MODE</b>" : "🔴 <b>LIVE MODE</b>"}`,
+    { parse_mode: "HTML" }
+  );
 }
 
 // ── Utilities ──────────────────────────────────────────────────────
